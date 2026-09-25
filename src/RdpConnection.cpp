@@ -27,6 +27,7 @@
 #include <freerdp/channels/drdynvc.h>
 
 #include "AbstractSession.h"
+#include "AudioStream.h"
 #include "Clipboard.h"
 #include "Cursor.h"
 #include "DisplayControl.h"
@@ -249,6 +250,7 @@ public:
 
     std::unique_ptr<InputHandler> inputHandler;
     std::unique_ptr<VideoStream> videoStream;
+    std::unique_ptr<AudioStream> audioStream;
     std::unique_ptr<Cursor> cursor;
     std::unique_ptr<NetworkDetection> networkDetection;
     std::unique_ptr<Clipboard> clipboard;
@@ -291,6 +293,7 @@ RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
             d->requestStop();
         }
     });
+    d->audioStream = std::make_unique<AudioStream>(this);
     d->cursor = std::make_unique<Cursor>(this);
     d->networkDetection = std::make_unique<NetworkDetection>(this);
     d->clipboard = std::make_unique<Clipboard>(this);
@@ -455,8 +458,7 @@ void RdpConnection::initialize()
     // PSEUDO_XSERVER is apparently required for things to work properly.
     freerdp_settings_set_uint32(settings, FreeRDP_OsMinorType, OSMINORTYPE_PSEUDO_XSERVER);
 
-    // TODO: Implement audio support
-    freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, false);
+    freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, true);
 
     freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 
@@ -479,7 +481,6 @@ void RdpConnection::initialize()
     freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, true);
 
     freerdp_settings_set_bool(settings, FreeRDP_RefreshRect, true);
-    freerdp_settings_set_bool(settings, FreeRDP_RemoteConsoleAudio, true);
     freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, false);
     freerdp_settings_set_bool(settings, FreeRDP_NSCodec, false);
     freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled, true);
@@ -487,7 +488,6 @@ void RdpConnection::initialize()
 
     freerdp_settings_set_bool(settings, FreeRDP_SupportMonitorLayoutPdu, true);
     freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, true);
-
 
     d->peer->Capabilities = peerCapabilities;
     d->peer->Activate = peerActivate;
@@ -525,17 +525,24 @@ void RdpConnection::run(std::stop_token stopToken)
     bool lastDrdynvcJoined = false;
     setState(State::Running);
 
+    // events[0] = virtual channel manager, events[1] = stopEvent (signalled
+    // for teardown), then peer transport handles, then the audio wake handle.
+    constexpr int MaxTransportHandles = 31;
     while (!stopToken.stop_requested()) {
-        // events[0] = virtual channel manager, events[1] = stopEvent (signalled
-        // for teardown), the rest = peer transport handles.
-        std::array<HANDLE, 33> events{channelEvent, d->stopEvent};
-        auto handleCount = d->peer->GetEventHandles(d->peer, events.data() + 2, 31);
+        std::array<HANDLE, 2 + MaxTransportHandles + 1> events{channelEvent, d->stopEvent};
+        auto handleCount = d->peer->GetEventHandles(d->peer, events.data() + 2, MaxTransportHandles);
         if (handleCount <= 0) {
             qCDebug(KRDP) << "Unable to get transport event handles";
             break;
         }
+        DWORD waitCount = 2 + handleCount;
+        int audioWakeIndex = -1;
+        if (HANDLE audioWake = static_cast<HANDLE>(d->audioStream->wakeHandle())) {
+            audioWakeIndex = waitCount;
+            events[waitCount++] = audioWake;
+        }
         // Wait for something to happen on the connection.
-        WaitForMultipleObjects(2 + handleCount, events.data(), FALSE, INFINITE);
+        DWORD waitResult = WaitForMultipleObjects(waitCount, events.data(), FALSE, INFINITE);
 
         // Bail out before touching the peer transport if we were asked to stop,
         // so teardown stays race-free.
@@ -543,10 +550,26 @@ void RdpConnection::run(std::stop_token stopToken)
             break;
         }
 
+        if (waitResult == WAIT_FAILED) {
+            qCWarning(KRDP) << "WaitForMultipleObjects failed; ending run loop";
+            break;
+        }
+
+        if (audioWakeIndex >= 0 && waitResult == static_cast<DWORD>(WAIT_OBJECT_0 + audioWakeIndex)) {
+            ResetEvent(events[audioWakeIndex]);
+            d->audioStream->handleMessages();
+            d->networkDetection->update();
+            continue;
+        }
+
         // Read data from the socket and have FreeRDP process it.
         if (d->peer->CheckFileDescriptor(d->peer) != TRUE) {
             qCDebug(KRDP) << "Unable to check file descriptor";
             break;
+        }
+
+        if (d->peer->connected && d->state == State::Activated) {
+            d->audioStream->initialize();
         }
 
         const bool cliprdrJoined = WTSVirtualChannelManagerIsChannelJoined(context->virtualChannelManager, CLIPRDR_SVC_CHANNEL_NAME);
@@ -596,6 +619,8 @@ void RdpConnection::run(std::stop_token stopToken)
             }
         }
 
+        d->audioStream->handleMessages();
+
         d->networkDetection->update();
     }
 
@@ -625,7 +650,7 @@ bool RdpConnection::onCapabilities()
         freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
     }
 
-    if (freerdp_settings_get_uint32(settings,FreeRDP_PointerCacheSize) <= 0) {
+    if (freerdp_settings_get_uint32(settings, FreeRDP_PointerCacheSize) <= 0) {
         qCWarning(KRDP) << "Client doesn't support pointer caching, aborting";
         return false;
     }
@@ -717,6 +742,7 @@ bool RdpConnection::onClose()
     d->displayControl->close();
     d->clipboard->close();
     d->videoStream->close();
+    d->audioStream->close();
     setState(State::Closed);
     return true;
 }
