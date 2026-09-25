@@ -18,6 +18,8 @@ target_sources(KRdp PRIVATE
     AbstractSession.cpp
     AudioEncoder.cpp
     AudioEncoder.h
+    AudinStream.cpp
+    AudinStream.h
     AudioStream.cpp
     AudioStream.h
     Clipboard.cpp

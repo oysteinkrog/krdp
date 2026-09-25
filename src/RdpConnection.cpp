@@ -27,6 +27,7 @@
 #include <freerdp/channels/drdynvc.h>
 
 #include "AbstractSession.h"
+#include "AudinStream.h"
 #include "AudioStream.h"
 #include "Clipboard.h"
 #include "Cursor.h"
@@ -251,6 +252,7 @@ public:
     std::unique_ptr<InputHandler> inputHandler;
     std::unique_ptr<VideoStream> videoStream;
     std::unique_ptr<AudioStream> audioStream;
+    std::unique_ptr<AudinStream> audinStream;
     std::unique_ptr<Cursor> cursor;
     std::unique_ptr<NetworkDetection> networkDetection;
     std::unique_ptr<Clipboard> clipboard;
@@ -294,6 +296,7 @@ RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
         }
     });
     d->audioStream = std::make_unique<AudioStream>(this);
+    d->audinStream = std::make_unique<AudinStream>(this);
     d->cursor = std::make_unique<Cursor>(this);
     d->networkDetection = std::make_unique<NetworkDetection>(this);
     d->clipboard = std::make_unique<Clipboard>(this);
@@ -616,6 +619,8 @@ void RdpConnection::run(std::stop_token stopToken)
                 } else {
                     setState(State::Streaming);
                 }
+
+                d->audinStream->open();
             }
         }
 
@@ -743,6 +748,7 @@ bool RdpConnection::onClose()
     d->clipboard->close();
     d->videoStream->close();
     d->audioStream->close();
+    d->audinStream->close();
     setState(State::Closed);
     return true;
 }
