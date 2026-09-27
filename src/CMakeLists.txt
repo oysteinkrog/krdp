@@ -16,8 +16,6 @@ endif()
 
 target_sources(KRdp PRIVATE
     AbstractSession.cpp
-    AudioEncoder.cpp
-    AudioEncoder.h
     AudinStream.cpp
     AudinStream.h
     AudioStream.cpp
@@ -91,10 +89,6 @@ target_link_libraries(KRdp PUBLIC
     PkgConfig::Libei
     XKB::XKB
     PkgConfig::PipeWire
-    PkgConfig::AVCodec
-    PkgConfig::AVUtil
-    PkgConfig::SWResample
-    PkgConfig::Opus
 )
 
 set_target_properties(KRdp PROPERTIES

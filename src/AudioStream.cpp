@@ -19,13 +19,14 @@
 
 #include <QScopeGuard>
 
-#include "AudioEncoder.h"
 #include "PeerContext_p.h"
 #include "PipeWireStreamUtils_p.h"
 #include "RdpConnection.h"
 #include "krdp_logging.h"
 
 #include <freerdp/codec/audio.h>
+#include <freerdp/codec/dsp.h>
+#include <freerdp/freerdp.h>
 #include <freerdp/server/rdpsnd.h>
 #include <freerdp/settings.h>
 #include <winpr/synch.h>
@@ -42,6 +43,7 @@ namespace KRdp
 
 static constexpr size_t s_maxBufferedBytes = 72000 * s_blockAlign;
 static constexpr int s_aacBitrate = 96000;
+static constexpr int s_aacFrameSamples = 1024;
 // mstsc decodes AAC at 44100 Hz whatever rate is negotiated, so that's the only AAC rate offered
 static constexpr uint32_t s_aacSampleRate = 44100;
 static constexpr int s_opusBitrate = 96000;
@@ -63,7 +65,7 @@ public:
         Aac,
         Opus
     } codec = Codec::Pcm;
-    AudioEncoder encoder;
+    std::unique_ptr<FREERDP_DSP_CONTEXT, decltype(&freerdp_dsp_context_free)> encoder{nullptr, freerdp_dsp_context_free};
     struct BlockInfo {
         uint16_t renderLatencyMs = 0;
         std::chrono::steady_clock::time_point setAt{};
@@ -341,8 +343,9 @@ bool AudioStream::initialize()
 
     const AUDIO_FORMAT aac = audioFormat(WAVE_FORMAT_AAC_MS, s_aacSampleRate, s_aacBitrate / 8);
     const AUDIO_FORMAT opus = audioFormat(WAVE_FORMAT_OPUS, 48000, s_opusBitrate / 8);
-    const bool haveAac = d->encoder.open(AudioEncoder::Codec::Aac, s_aacSampleRate, s_channels, s_aacBitrate);
-    const bool haveOpus = d->encoder.open(AudioEncoder::Codec::Opus, 48000, s_channels, s_opusBitrate);
+    const bool haveAac = freerdp_dsp_supports_format(&aac, TRUE);
+    // FreeRDP's non-FFmpeg Opus encoder over-reports each packet's length by 4x (dsp.c, freerdp_dsp_encode_opus)
+    const bool haveOpus = strstr(freerdp_get_build_config(), "WITH_DSP_FFMPEG=ON") && freerdp_dsp_supports_format(&opus, TRUE);
     const uint16_t numFormats = uint16_t(2 + (haveAac ? 1 : 0) + (haveOpus ? 1 : 0));
 
     auto *formats = static_cast<AUDIO_FORMAT *>(calloc(numFormats, sizeof(AUDIO_FORMAT)));
@@ -440,6 +443,13 @@ void AudioStream::Private::onActivated()
             }
             codec = formatTag == WAVE_FORMAT_AAC_MS ? Codec::Aac : formatTag == WAVE_FORMAT_OPUS ? Codec::Opus : Codec::Pcm;
             const char *codecName = codec == Codec::Aac ? "AAC" : codec == Codec::Opus ? "Opus" : "PCM";
+            if (codec != Codec::Pcm) {
+                encoder.reset(freerdp_dsp_context_new(TRUE));
+                if (!encoder || !freerdp_dsp_context_reset(encoder.get(), &rdpsnd->server_formats[j], 0)) {
+                    qCWarning(KRDP) << "Audio: FreeRDP could not set up the" << codecName << "encoder";
+                    continue;
+                }
+            }
             clientFormatIndex = i;
             sampleRate = rdpsnd->server_formats[j].nSamplesPerSec;
             qCDebug(KRDP) << "Audio: negotiated" << codecName << sampleRate << "Hz stereo; starting capture";
@@ -565,7 +575,7 @@ void AudioStream::Private::clearBlockInfos()
 
 int AudioStream::Private::frameSamples() const
 {
-    return codec == Codec::Aac ? encoder.frameSamples(AudioEncoder::Codec::Aac) : int(sampleRate / 50);
+    return codec == Codec::Aac ? s_aacFrameSamples : int(sampleRate / 50);
 }
 
 QByteArray AudioStream::Private::encodeFrame(const uint8_t *pcm)
@@ -574,8 +584,14 @@ QByteArray AudioStream::Private::encodeFrame(const uint8_t *pcm)
     if (codec == Codec::Pcm) {
         return QByteArray(reinterpret_cast<const char *>(pcm), qsizetype(frameBytes));
     }
-    const auto units = encoder.encode(codec == Codec::Aac ? AudioEncoder::Codec::Aac : AudioEncoder::Codec::Opus, pcm, frameBytes);
-    return units.empty() ? QByteArray() : units.front();
+    const AUDIO_FORMAT source = audioFormat(WAVE_FORMAT_PCM, sampleRate);
+    wStream *out = Stream_New(nullptr, frameBytes);
+    QByteArray unit;
+    if (out && freerdp_dsp_encode(encoder.get(), &source, pcm, frameBytes, out)) {
+        unit = QByteArray(reinterpret_cast<const char *>(Stream_Buffer(out)), qsizetype(Stream_GetPosition(out)));
+    }
+    Stream_Free(out, TRUE);
+    return unit;
 }
 
 void AudioStream::Private::sendPackets()

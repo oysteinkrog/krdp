@@ -73,10 +73,6 @@ set_package_properties(PAM PROPERTIES DESCRIPTION "PAM Libraries"
 pkg_check_modules(Libei REQUIRED IMPORTED_TARGET libei-1.0>=1.6)
 
 pkg_check_modules(PipeWire REQUIRED IMPORTED_TARGET libpipewire-0.3)
-pkg_check_modules(AVCodec REQUIRED IMPORTED_TARGET libavcodec)
-pkg_check_modules(AVUtil REQUIRED IMPORTED_TARGET libavutil)
-pkg_check_modules(SWResample REQUIRED IMPORTED_TARGET libswresample)
-pkg_check_modules(Opus REQUIRED IMPORTED_TARGET opus)
 
 ecm_find_qmlmodule(org.kde.kirigamiaddons.formcard REQUIRED)
 
