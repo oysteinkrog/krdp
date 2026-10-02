@@ -16,6 +16,10 @@ endif()
 
 target_sources(KRdp PRIVATE
     AbstractSession.cpp
+    AudinStream.cpp
+    AudinStream.h
+    AudioStream.cpp
+    AudioStream.h
     Clipboard.cpp
     Clipboard.h
     DisplayControl.cpp
@@ -29,6 +33,7 @@ target_sources(KRdp PRIVATE
     InputHandler.h
     PeerContext.cpp
     PeerContext_p.h
+    PipeWireStreamUtils_p.h
     PortalSession.cpp
     PortalSession.h
     VideoStream.cpp
@@ -83,6 +88,7 @@ target_link_libraries(KRdp PUBLIC
     K::KPipeWireDmaBuf
     PkgConfig::Libei
     XKB::XKB
+    PkgConfig::PipeWire
 )
 
 set_target_properties(KRdp PROPERTIES

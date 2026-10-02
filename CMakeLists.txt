@@ -72,6 +72,8 @@ set_package_properties(PAM PROPERTIES DESCRIPTION "PAM Libraries"
 
 pkg_check_modules(Libei REQUIRED IMPORTED_TARGET libei-1.0>=1.6)
 
+pkg_check_modules(PipeWire REQUIRED IMPORTED_TARGET libpipewire-0.3)
+
 ecm_find_qmlmodule(org.kde.kirigamiaddons.formcard REQUIRED)
 
 set(EXCLUDE_DEPRECATED_BEFORE_AND_AT 0 CACHE STRING "Control the range of deprecated API excluded from the build [default=0].")

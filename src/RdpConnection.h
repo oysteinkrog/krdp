@@ -113,6 +113,8 @@ private:
     friend class Cursor;
     friend class VideoStream;
     friend class VideoStreamSurface;
+    friend class AudioStream;
+    friend class AudinStream;
     friend class NetworkDetection;
     friend class Clipboard;
     friend class DisplayControl;
