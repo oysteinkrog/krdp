@@ -474,7 +474,10 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         qCDebug(KRDP) << "GFX channel reset (re-advertisement), resetting surface state";
         d->capsConfirmed = false;
         d->surface->pendingReset = true;
-        destroySurface();
+        // A client that re-advertises has already dropped its GFX state. Sending it
+        // DeleteSurface or DeleteEncodingContext for surfaces it no longer knows makes
+        // mstsc stop acknowledging frames (black screen), so only forget them locally.
+        forgetSurface();
         std::lock_guard lock(d->pendingFramesMutex);
         d->pendingFrames.clear();
     }
@@ -641,6 +644,15 @@ void VideoStream::destroySurface()
         progressive_delete_surface_context(d->progressive.get(), surface.id);
     }
 
+    surface = Surface{};
+}
+
+void VideoStream::forgetSurface()
+{
+    auto &surface = d->surface->surface;
+    if (surface.id != 0 && d->progressive) {
+        progressive_delete_surface_context(d->progressive.get(), surface.id);
+    }
     surface = Surface{};
 }
 

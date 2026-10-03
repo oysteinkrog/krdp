@@ -111,6 +111,7 @@ private:
     bool streamingEnabled() const;
     void failVideoInitialization();
     void destroySurface();
+    void forgetSurface();
     void performReset(QSize size);
     bool hasInFlightCapacity() const;
     void sendFrame(const VideoFrame &frame);
