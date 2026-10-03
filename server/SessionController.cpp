@@ -14,6 +14,8 @@
 #include <QDBusPendingReply>
 #include <QDBusReply>
 #include <QMenu>
+#include <QProcess>
+#include <QTimer>
 
 #include <KLocalizedString>
 
@@ -57,6 +59,26 @@ public:
         });
         connect(connection->displayControl(), &KRdp::DisplayControl::requestedScreenSizeChanged, connection->videoStream(), &KRdp::VideoStream::setRequestedSize);
 
+        // Streaming a real monitor: a virtual monitor resize does not apply, so hand the
+        // client's size to an optional hook that can change the monitor's mode instead.
+        // Debounced, because a client sends a layout for every step of a window drag.
+        m_resizeHook = qEnvironmentVariable("KRDP_OUTPUT_RESIZE_HOOK");
+        if (!m_resizeHook.isEmpty()) {
+            m_resizeTimer.setSingleShot(true);
+            m_resizeTimer.setInterval(500);
+            connect(&m_resizeTimer, &QTimer::timeout, this, [this]() {
+                if (session->virtualMonitor()) {
+                    return;
+                }
+                qInfo() << "Running output resize hook for client size" << m_requestedSize;
+                QProcess::startDetached(m_resizeHook, {QString::number(m_requestedSize.width()), QString::number(m_requestedSize.height())});
+            });
+            connect(connection->displayControl(), &KRdp::DisplayControl::requestedScreenSizeChanged, this, [this](const QSize &size) {
+                m_requestedSize = size;
+                m_resizeTimer.start();
+            });
+        }
+
         connect(connection, &QObject::destroyed, this, &SessionWrapper::onConnectionDestroyed);
     }
 
@@ -95,6 +117,9 @@ public:
     std::unique_ptr<KRdp::AbstractSession> session;
     QPointer<KRdp::RdpConnection> connection;
     KStatusNotifierItem *m_sni;
+    QString m_resizeHook;
+    QTimer m_resizeTimer;
+    QSize m_requestedSize;
     bool m_sessionStarted = false;
 };
 
