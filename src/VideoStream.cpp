@@ -470,6 +470,7 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
     // initial setup and again after confirming. If we already confirmed
     // caps, this is a GFX channel reset — clear surface state so
     // surfaces get re-created on the next frame.
+    const bool readvertised = d->capsConfirmed;
     if (d->capsConfirmed) {
         qCDebug(KRDP) << "GFX channel reset (re-advertisement), resetting surface state";
         d->capsConfirmed = false;
@@ -544,7 +545,13 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
 
     QMetaObject::invokeMethod(
         this,
-        [this, negotiatedMode]() {
+        [this, negotiatedMode, readvertised]() {
+            if (readvertised) {
+                // The client dropped every frame it had, including the H.264 key frame.
+                // setActiveEncodingMode() skips an unchanged mode, so force a new encoder:
+                // a fresh encoder starts with a key frame, without one the client stays black.
+                d->activeEncodingMode.reset();
+            }
             setActiveEncodingMode(negotiatedMode);
         },
         Qt::BlockingQueuedConnection); // RDP callbacks are on the connection thread, VideoStream operates on the main thread
