@@ -305,6 +305,10 @@ bool VideoStream::initialize()
                 std::this_thread::sleep_for(std::chrono::milliseconds(1000) / d->requestedFrameRate.load());
                 continue;
             }
+            // sendFrame() can drop the frame without sending it (write blocked, or a GFX reset
+            // in progress). Re-check backpressure for every frame taken off the queue, otherwise
+            // a paused encoder is never resumed once the queue drains that way.
+            QMetaObject::invokeMethod(this, &VideoStream::updateBackpressure, Qt::QueuedConnection);
             sendFrame(nextFrame);
         }
     });
