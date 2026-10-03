@@ -8,6 +8,8 @@
 #include <chrono>
 #include <optional>
 
+#include <unistd.h>
+
 #include <QDateTime>
 
 #include "krdp_logging.h"
@@ -96,7 +98,9 @@ void VideoStreamSurface::setActiveEncodingMode(VideoStream::EncodingMode mode, q
             encodedStream->setObjectSerial(objectSerial);
             encodedStream->setNodeId(nodeId);
             if (pipeWireFd > 0) {
-                encodedStream->setFd(pipeWireFd);
+                // KPipeWire closes the fd when its encoder stops; give each encoder its
+                // own copy so a restarted encoder can still reach the stream.
+                encodedStream->setFd(dup(pipeWireFd));
             }
         }
         if (m_stream->streamingEnabled() && nodeId != 0) {
@@ -200,7 +204,9 @@ void VideoStreamSurface::setPipeWireSource(quint32 newNodeId, quint64 newObjectS
     if (encodedStream) {
         encodedStream->setObjectSerial(objectSerial);
         encodedStream->setNodeId(nodeId);
-        encodedStream->setFd(pipeWireFd);
+        if (pipeWireFd > 0) {
+            encodedStream->setFd(dup(pipeWireFd));
+        }
         if (m_stream->streamingEnabled()) {
             encodedStream->start();
         }
