@@ -59,17 +59,15 @@ public:
         });
         connect(connection->displayControl(), &KRdp::DisplayControl::requestedScreenSizeChanged, connection->videoStream(), &KRdp::VideoStream::setRequestedSize);
 
-        // Streaming a real monitor: a virtual monitor resize does not apply, so hand the
+        // When streaming a real monitor (--monitor), KRDP cannot resize it, so hand the
         // client's size to an optional hook that can change the monitor's mode instead.
+        // Only set the variable for --monitor; a virtual monitor already follows the client.
         // Debounced, because a client sends a layout for every step of a window drag.
         m_resizeHook = qEnvironmentVariable("KRDP_OUTPUT_RESIZE_HOOK");
         if (!m_resizeHook.isEmpty()) {
             m_resizeTimer.setSingleShot(true);
             m_resizeTimer.setInterval(500);
             connect(&m_resizeTimer, &QTimer::timeout, this, [this]() {
-                if (session->virtualMonitor()) {
-                    return;
-                }
                 qInfo() << "Running output resize hook for client size" << m_requestedSize;
                 QProcess::startDetached(m_resizeHook, {QString::number(m_requestedSize.width()), QString::number(m_requestedSize.height())});
             });
