@@ -12,6 +12,7 @@
 #include <cstring>
 #include <vector>
 
+#include <QProcess>
 #include <QScopeGuard>
 
 #include "PeerContext_p.h"
@@ -46,6 +47,12 @@ public:
     pw_stream *stream = nullptr;
     spa_hook streamListener{};
     bool micSetupTried = false;
+    // The configured default source before we pointed it at the virtual microphone,
+    // as the JSON value pw-metadata prints; empty when none was set.
+    QString savedDefaultSource;
+    bool defaultSourceChanged = false;
+    void makeMicrophoneDefault();
+    void restoreDefaultSource();
 
     AudioByteQueue captureRing{size_t(s_sampleRate) * s_maxLatencyMs / 1000 * s_blockAlign};
     bool captureDropWarned = false;
@@ -159,6 +166,62 @@ bool AudinStream::open()
     return true;
 }
 
+namespace
+{
+constexpr auto s_defaultSourceKey = "default.configured.audio.source";
+
+QString readDefaultSource()
+{
+    QProcess p;
+    p.start(QStringLiteral("pw-metadata"), {QStringLiteral("0"), QString::fromLatin1(s_defaultSourceKey)});
+    if (!p.waitForFinished(2000)) {
+        return {};
+    }
+    const QString out = QString::fromUtf8(p.readAllStandardOutput());
+    const QString start = QStringLiteral("value:'");
+    const qsizetype from = out.indexOf(start);
+    if (from < 0) {
+        return {};
+    }
+    const qsizetype to = out.indexOf(QStringLiteral("' type:"), from);
+    return to < 0 ? QString() : out.mid(from + start.size(), to - from - start.size());
+}
+
+bool writeDefaultSource(const QString &json)
+{
+    QStringList args;
+    if (json.isEmpty()) {
+        args = {QStringLiteral("-d"), QStringLiteral("0"), QString::fromLatin1(s_defaultSourceKey)};
+    } else {
+        args = {QStringLiteral("0"), QString::fromLatin1(s_defaultSourceKey), json, QStringLiteral("Spa:String:JSON")};
+    }
+    return QProcess::execute(QStringLiteral("pw-metadata"), args) == 0;
+}
+}
+
+void AudinStream::Private::makeMicrophoneDefault()
+{
+    // Apps record from the default source, so point it at the client's microphone
+    // while connected and put the previous choice back on disconnect.
+    savedDefaultSource = readDefaultSource();
+    if (writeDefaultSource(QStringLiteral(R"({"name":"krdp_microphone"})"))) {
+        defaultSourceChanged = true;
+        qCDebug(KRDP) << "Audio input: made the Remote Desktop microphone the default source; previous" << savedDefaultSource;
+    } else {
+        qCWarning(KRDP) << "Audio input: could not make the Remote Desktop microphone the default source";
+    }
+}
+
+void AudinStream::Private::restoreDefaultSource()
+{
+    if (!defaultSourceChanged) {
+        return;
+    }
+    defaultSourceChanged = false;
+    writeDefaultSource(savedDefaultSource);
+    qCDebug(KRDP) << "Audio input: restored the default source" << savedDefaultSource;
+}
+
 void AudinStream::Private::ensureMicrophone()
 {
     if (micSetupTried) {
@@ -211,6 +274,7 @@ void AudinStream::Private::ensureMicrophone()
     }
 
     qCDebug(KRDP) << "Audio input: virtual microphone ready";
+    makeMicrophoneDefault();
 }
 
 void AudinStream::Private::onData(const SNDIN_DATA *data)
@@ -239,6 +303,7 @@ void AudinStream::Private::onData(const SNDIN_DATA *data)
 
 void AudinStream::Private::teardownMicrophone()
 {
+    restoreDefaultSource();
     if (pipewire && pipewire->loop()) {
         pw_thread_loop_lock(pipewire->loop());
         destroyPwStream(stream, streamListener);
