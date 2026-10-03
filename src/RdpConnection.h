@@ -8,6 +8,7 @@
 #include <thread>
 
 #include <QObject>
+#include <QSize>
 
 #include <freerdp/freerdp.h>
 
@@ -101,6 +102,12 @@ public:
     Clipboard *clipboard() const;
 
     DisplayControl *displayControl() const;
+
+    /**
+     * The desktop size the client asked for when it connected, or an invalid
+     * size before the capability exchange.
+     */
+    QSize clientDesktopSize() const;
 
     NetworkDetection *networkDetection() const;
 

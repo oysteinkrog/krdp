@@ -257,6 +257,7 @@ public:
     std::unique_ptr<NetworkDetection> networkDetection;
     std::unique_ptr<Clipboard> clipboard;
     std::unique_ptr<DisplayControl> displayControl;
+    QSize clientDesktopSize;
 
     freerdp_peer *peer = nullptr;
 
@@ -391,6 +392,11 @@ Clipboard *RdpConnection::clipboard() const
 DisplayControl *RdpConnection::displayControl() const
 {
     return d->displayControl.get();
+}
+
+QSize RdpConnection::clientDesktopSize() const
+{
+    return d->clientDesktopSize;
 }
 
 NetworkDetection *RdpConnection::networkDetection() const
@@ -660,6 +666,10 @@ bool RdpConnection::onCapabilities()
         qCWarning(KRDP) << "Client doesn't support pointer caching, aborting";
         return false;
     }
+
+    // Read before any surface reset overwrites DesktopWidth/Height with the stream size.
+    d->clientDesktopSize = QSize(int(freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth)), int(freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight)));
+    qCDebug(KRDP) << "Client desktop size" << d->clientDesktopSize;
 
     return true;
 }

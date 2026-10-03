@@ -75,6 +75,11 @@ public:
                 m_requestedSize = size;
                 m_resizeTimer.start();
             });
+            // Fit the monitor to the client's window or screen at connect, not only on resize.
+            if (connection->clientDesktopSize().isValid()) {
+                m_requestedSize = connection->clientDesktopSize();
+                m_resizeTimer.start();
+            }
         }
 
         connect(connection, &QObject::destroyed, this, &SessionWrapper::onConnectionDestroyed);
