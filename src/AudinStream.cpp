@@ -9,9 +9,11 @@
 
 #include "AudinStream.h"
 
+#include <atomic>
 #include <cstring>
 #include <vector>
 
+#include <QElapsedTimer>
 #include <QProcess>
 #include <QScopeGuard>
 
@@ -34,6 +36,10 @@ namespace KRdp
 
 static constexpr uint32_t s_sampleRate = 44100;
 static constexpr uint32_t s_maxLatencyMs = 200;
+// mstsc rejects the AUDIO_INPUT channel when it is opened very early in the session
+// (within about 100 ms of activation), so retry when the client hasn't answered.
+static constexpr qint64 s_openTimeoutMs = 2000;
+static constexpr int s_maxOpenAttempts = 3;
 
 class AudinStream::Private
 {
@@ -42,6 +48,11 @@ public:
 
     audin_server_context *audin = nullptr;
     bool openTried = false;
+    int openAttempts = 0;
+    QElapsedTimer openedAt;
+    // Set from FreeRDP's audin thread when the client's Version PDU arrives.
+    std::atomic<bool> clientAnswered = false;
+    psAudinServerVersion defaultReceiveVersion = nullptr;
 
     std::unique_ptr<PipeWireLoopConnection> pipewire;
     pw_stream *stream = nullptr;
@@ -63,6 +74,7 @@ public:
     void teardownMicrophone();
 
     static UINT audinData(audin_server_context *context, const SNDIN_DATA *data);
+    static UINT audinVersion(audin_server_context *context, const SNDIN_VERSION *version);
 
 private:
     static void streamParamChanged(void *data, uint32_t id, const spa_pod *param);
@@ -74,6 +86,13 @@ private:
         .process = streamProcess,
     };
 };
+
+UINT AudinStream::Private::audinVersion(audin_server_context *context, const SNDIN_VERSION *version)
+{
+    auto *d = static_cast<Private *>(context->userdata);
+    d->clientAnswered = true;
+    return d->defaultReceiveVersion ? d->defaultReceiveVersion(context, version) : CHANNEL_RC_OK;
+}
 
 UINT AudinStream::Private::audinData(audin_server_context *context, const SNDIN_DATA *data)
 {
@@ -119,7 +138,14 @@ AudinStream::~AudinStream()
 bool AudinStream::open()
 {
     if (d->audin) {
-        return true;
+        if (d->clientAnswered || d->openedAt.elapsed() < s_openTimeoutMs || d->openAttempts >= s_maxOpenAttempts) {
+            return true;
+        }
+        qCWarning(KRDP) << "Audio input: client did not answer the audin channel; reopening, attempt" << d->openAttempts + 1;
+        d->audin->Close(d->audin);
+        audin_server_context_free(d->audin);
+        d->audin = nullptr;
+        d->openTried = false;
     }
     if (d->openTried) {
         return false;
@@ -144,6 +170,9 @@ bool AudinStream::open()
     d->audin->userdata = d.get();
     d->audin->rdpcontext = d->connection->rdpPeerContext();
     d->audin->Data = Private::audinData;
+    d->defaultReceiveVersion = d->audin->ReceiveVersion;
+    d->audin->ReceiveVersion = Private::audinVersion;
+    d->clientAnswered = false;
 
     auto cleanup = qScopeGuard([this]() {
         audin_server_context_free(d->audin);
@@ -161,6 +190,8 @@ bool AudinStream::open()
         return false;
     }
     cleanup.dismiss();
+    d->openedAt.start();
+    ++d->openAttempts;
 
     qCDebug(KRDP) << "Audio input (audin) channel opened";
     return true;
