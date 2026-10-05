@@ -53,6 +53,8 @@ constexpr qsizetype LowQueueCount = 1; // Level of frames in the pending-send qu
 
 constexpr uint32_t ProgressiveCodecContextId = 1;
 
+constexpr clk::milliseconds FirstFrameDelay(500); // after the first CapsConfirm of a connection
+
 // RemoteFX quantization, in the order LL3, LH3, HL3, HH3, LH2, HL2, HH2, LH1, HL1, HH1.
 // 6 keeps a band at full precision; each step above halves it. The finest bands (the
 // last three) carry text edges.
@@ -198,6 +200,8 @@ public:
     bool enabled = false;
     bool streamingEnabled = false;
     bool capsConfirmed = false;
+    // No frames before this time; see onCapsAdvertise().
+    std::atomic<clk::steady_clock::time_point> firstFrameNotBefore{};
     bool channelOpen = false;
 
     std::jthread frameSubmissionThread;
@@ -454,7 +458,7 @@ bool VideoStream::initialize()
 
     d->frameSubmissionThread = std::jthread([this](std::stop_token token) {
         while (!token.stop_requested()) {
-            if (!hasInFlightCapacity() || !d->gfxContext || !d->capsConfirmed) {
+            if (!hasInFlightCapacity() || !d->gfxContext || !d->capsConfirmed || clk::steady_clock::now() < d->firstFrameNotBefore.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
@@ -756,6 +760,13 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         return status;
     }
 
+    if (!readvertised) {
+        // On a reconnect mstsc resets its GFX channel and advertises its caps again 50 to
+        // 100 ms after our first CapsConfirm. Anything we send in between (ResetGraphics,
+        // CreateSurface, a frame) makes it drop the connection with a protocol error. The
+        // KPipeWire encoder never had a frame ready that soon; FreeRDP with NVENC does.
+        d->firstFrameNotBefore = clk::steady_clock::now() + FirstFrameDelay;
+    }
     d->capsConfirmed = true;
 
     return CHANNEL_RC_OK;
