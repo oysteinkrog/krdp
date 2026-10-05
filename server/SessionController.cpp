@@ -67,22 +67,31 @@ public:
         if (!m_resizeHook.isEmpty()) {
             m_resizeTimer.setSingleShot(true);
             m_resizeTimer.setInterval(500);
-            connect(&m_resizeTimer, &QTimer::timeout, this, [this]() {
-                qInfo() << "Running output resize hook for client size" << m_requestedSize;
-                QProcess::startDetached(m_resizeHook, {QString::number(m_requestedSize.width()), QString::number(m_requestedSize.height())});
-            });
+            connect(&m_resizeTimer, &QTimer::timeout, this, &SessionWrapper::runResizeHook);
             connect(connection->displayControl(), &KRdp::DisplayControl::requestedScreenSizeChanged, this, [this](const QSize &size) {
                 m_requestedSize = size;
                 m_resizeTimer.start();
             });
             // Fit the monitor to the client's window or screen at connect, not only on resize.
+            // Run it at once rather than debounced: until the monitor has the client's size,
+            // the stream holds back frames (see waitForFrameSize()).
             if (connection->clientDesktopSize().isValid()) {
                 m_requestedSize = connection->clientDesktopSize();
-                m_resizeTimer.start();
+                runResizeHook();
             }
         }
 
         connect(connection, &QObject::destroyed, this, &SessionWrapper::onConnectionDestroyed);
+    }
+
+    void runResizeHook()
+    {
+        if (!connection) {
+            return;
+        }
+        qInfo() << "Running output resize hook for client size" << m_requestedSize;
+        connection->videoStream()->waitForFrameSize(m_requestedSize, std::chrono::seconds(3));
+        QProcess::startDetached(m_resizeHook, {QString::number(m_requestedSize.width()), QString::number(m_requestedSize.height())});
     }
 
     void onCursorUpdate(const PipeWireCursor &cursor)

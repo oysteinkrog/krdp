@@ -200,6 +200,10 @@ public:
     bool enabled = false;
     bool streamingEnabled = false;
     bool capsConfirmed = false;
+
+    std::mutex expectedSizeMutex;
+    QSize expectedFrameSize; // see waitForFrameSize()
+    clk::steady_clock::time_point expectedSizeDeadline;
     // No frames before this time; see onCapsAdvertise().
     std::atomic<clk::steady_clock::time_point> firstFrameNotBefore{};
     bool channelOpen = false;
@@ -617,6 +621,13 @@ void VideoStream::seedQuality(quint8 quality)
     const quint8 hi = std::max<quint8>(d->qualityCap, quint8(MinAdaptiveQuality));
     d->quality = std::clamp<quint8>(quality, quint8(MinAdaptiveQuality), hi);
     applyQuality();
+}
+
+void VideoStream::waitForFrameSize(const QSize &size, std::chrono::milliseconds timeout)
+{
+    std::lock_guard lock(d->expectedSizeMutex);
+    d->expectedFrameSize = size;
+    d->expectedSizeDeadline = clk::steady_clock::now() + timeout;
 }
 
 void VideoStream::setRequestedSize(const QSize &size)
@@ -1078,6 +1089,20 @@ void VideoStream::sendFrame(const VideoFrame &frame)
 
     if (!d->gfxContext || !d->capsConfirmed) {
         return;
+    }
+
+    {
+        std::lock_guard lock(d->expectedSizeMutex);
+        if (d->expectedFrameSize.isValid()) {
+            if (frame.size == d->expectedFrameSize) {
+                d->expectedFrameSize = QSize();
+            } else if (clk::steady_clock::now() < d->expectedSizeDeadline) {
+                return; // the monitor is still being resized
+            } else {
+                qCDebug(KRDP) << "Monitor did not reach" << d->expectedFrameSize << "in time; streaming" << frame.size;
+                d->expectedFrameSize = QSize();
+            }
+        }
     }
 
     if (d->surface->pendingReset) {

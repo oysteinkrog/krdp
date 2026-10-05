@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 
 #include <QObject>
@@ -126,6 +127,12 @@ public:
     void setAdaptiveQuality(bool enabled);
     void seedQuality(quint8 quality);
     void setRequestedSize(const QSize &size);
+    /**
+     * Hold back frames of any other size until one of this size arrives or the
+     * timeout passes. Used while a resize hook changes the monitor to the client's
+     * size: mstsc drops the connection if a new session starts at the wrong size.
+     */
+    void waitForFrameSize(const QSize &size, std::chrono::milliseconds timeout);
     void setPipeWireSource(quint32 nodeId, quint64 objectSerial, int fd = -1);
 
     bool openChannel();
