@@ -71,6 +71,14 @@ void VideoStreamSurface::setActiveEncodingMode(VideoStream::EncodingMode mode, q
         encodedStream->stop();
         encodedStream.reset();
     }
+    if (sourceStream && mode != VideoStream::EncodingMode::H264) {
+        // Every raw frame mode uses the same source stream, so keep it. Destroying it
+        // drops the last reference to KPipeWire's PipeWire core, which closes the shared
+        // fd, and a new stream on that fd then fails to connect. mstsc re-advertises its
+        // caps on every connection, which used to do exactly that.
+        sourceStream->setActive(m_stream->streamingEnabled() && nodeId != 0);
+        return;
+    }
     if (sourceStream) {
         sourceStream->stopStreaming();
         sourceStream.reset();
