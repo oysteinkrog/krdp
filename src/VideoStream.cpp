@@ -582,7 +582,8 @@ void VideoStream::setStreamingEnabled(bool enabled)
 void VideoStream::applyQuality()
 {
     d->surface->setVideoQuality(d->quality);
-    d->h264TargetQp = h264QpForQuality(d->quality);
+    // The FreeRDP encoders use the configured quality only; see updateAdaptiveQuality().
+    d->h264TargetQp = h264QpForQuality(d->qualityCap);
 }
 
 void VideoStream::setVideoQuality(quint8 quality)
@@ -606,7 +607,7 @@ void VideoStream::setAdaptiveQuality(bool enabled)
 
 void VideoStream::seedQuality(quint8 quality)
 {
-    if (!d->adaptiveQuality || (d->activeEncodingMode != EncodingMode::H264 && !usesFreeRdpH264(d->activeEncodingMode))) {
+    if (!d->adaptiveQuality || d->activeEncodingMode != EncodingMode::H264) {
         return;
     }
     const quint8 hi = std::max<quint8>(d->qualityCap, quint8(MinAdaptiveQuality));
@@ -891,6 +892,13 @@ void VideoStream::performReset(QSize newSize)
         return;
     }
 
+    if (usesFreeRdpH264(d->activeEncodingMode)) {
+        // A new surface starts black on the client. FreeRDP only lists the blocks that
+        // changed since its previous frame, so a reused encoder would leave every
+        // unchanged block black. A fresh encoder lists the whole frame first.
+        d->h264Recreate = true;
+    }
+
     surface = Surface{
         .id = surfaceId,
         .codecContextId = d->activeEncodingMode == EncodingMode::Progressive ? ProgressiveCodecContextId : 0,
@@ -989,7 +997,9 @@ void VideoStream::updateInFlightWindow()
 
 void VideoStream::updateAdaptiveQuality()
 {
-    if (!d->adaptiveQuality || (d->activeEncodingMode != EncodingMode::H264 && !usesFreeRdpH264(d->activeEncodingMode))) {
+    // Not for the FreeRDP encoders: a new QP needs a new encoder and a key frame, and
+    // adaptive quality changes it every few seconds.
+    if (!d->adaptiveQuality || d->activeEncodingMode != EncodingMode::H264) {
         return;
     }
 
