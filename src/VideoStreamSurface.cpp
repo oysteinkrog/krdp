@@ -138,11 +138,14 @@ void VideoStreamSurface::setActiveEncodingMode(VideoStream::EncodingMode mode, q
             Qt::QueuedConnection);
 
         if (nodeId != 0 && pipeWireFd) {
+            // KPipeWire closes the fd when the stream goes away; give each stream its own
+            // copy, like the H.264 encoders get, or a second stream cannot connect.
+            const int streamFd = pipeWireFd > 0 ? dup(pipeWireFd) : pipeWireFd;
             bool created = false;
             if (objectSerial != quint64(-1)) {
-                created = sourceStream->createStream(objectSerial, pipeWireFd);
+                created = sourceStream->createStream(objectSerial, streamFd);
             } else {
-                created = sourceStream->createStream(nodeId, pipeWireFd);
+                created = sourceStream->createStream(nodeId, streamFd);
             }
             if (!created) {
                 qCWarning(KRDP) << "Could not create PipeWire source stream" << sourceStream->error();
@@ -217,11 +220,12 @@ void VideoStreamSurface::setPipeWireSource(quint32 newNodeId, quint64 newObjectS
         return;
     }
 
+    const int streamFd = fd > 0 ? dup(fd) : fd;
     bool created = false;
     if (objectSerial != quint64(-1)) {
-        created = sourceStream->createStream(objectSerial, fd);
+        created = sourceStream->createStream(objectSerial, streamFd);
     } else {
-        created = sourceStream->createStream(nodeId, fd);
+        created = sourceStream->createStream(nodeId, streamFd);
     }
 
     if (!created) {
