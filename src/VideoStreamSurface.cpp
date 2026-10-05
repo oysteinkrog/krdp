@@ -261,7 +261,8 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
         }
         frameData.image = std::move(image);
     } else {
-        qCWarning(KRDP) << "PipeWire frame did not contain usable image data";
+        // KWin sends buffers without image data when only the cursor moved; the cursor
+        // itself is handled by the other frameReceived connection.
         return;
     }
 
