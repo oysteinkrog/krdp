@@ -10,6 +10,7 @@
 #include <DmaBufHandler>
 #include <PipeWireEncodedStream>
 #include <PipeWireSourceStream>
+#include <freerdp/codec/h264.h>
 #include <freerdp/codec/progressive.h>
 #include <freerdp/server/rdpgfx.h>
 
@@ -40,6 +41,13 @@ public:
     void onFrameReceived(const PipeWireFrame &data);
     bool sendFrameH264(RdpgfxServerContext *gfxContext, uint32_t frameId, const VideoFrame &frame);
     bool sendFrameProgressive(RdpgfxServerContext *gfxContext, PROGRESSIVE_CONTEXT *progressive, uint32_t frameId, const VideoFrame &frame);
+
+    enum class AvcResult {
+        Sent,
+        Unchanged, ///< nothing changed since the last frame, nothing sent
+        Failed, ///< the encoder failed
+    };
+    AvcResult sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *h264, bool avc444, uint32_t frameId, const VideoFrame &frame);
 
     std::unique_ptr<PipeWireEncodedStream> encodedStream;
     std::unique_ptr<PipeWireSourceStream> sourceStream;

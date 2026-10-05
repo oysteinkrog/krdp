@@ -473,8 +473,8 @@ void RdpConnection::initialize()
     freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 
     freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, true);
-    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, false);
-    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, false);
+    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, VideoStream::avc444Allowed());
+    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, VideoStream::avc444Allowed());
     freerdp_settings_set_bool(settings, FreeRDP_GfxH264, !VideoStream::h264Disabled());
     freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, true);
     freerdp_settings_set_bool(settings, FreeRDP_SmartSizing, true);

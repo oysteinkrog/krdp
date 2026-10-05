@@ -25,6 +25,38 @@ class RdpConnection;
 class VideoStreamSurface;
 
 /**
+ * How the server encodes video, read from the settings file at startup.
+ */
+struct KRDP_EXPORT VideoEncoderSettings {
+    enum class Codec {
+        KPipeWire, ///< H.264 4:2:0 from the KPipeWire encoder (the original path)
+        Auto, ///< AVC444 if the client supports it, else AVC420, else RemoteFX
+        AVC444, ///< H.264 4:4:4 (AVC444v2) from FreeRDP, falling back like Auto
+        AVC420, ///< H.264 4:2:0 from FreeRDP, else RemoteFX
+        RemoteFX, ///< RemoteFX Progressive, no H.264
+    };
+    enum class Encoder {
+        Auto, ///< NVENC, and libx264 if NVENC cannot encode
+        NVENC,
+        Libx264,
+    };
+    enum class Speed {
+        Default,
+        Fast,
+        Fastest,
+    };
+
+    Codec codec = Codec::KPipeWire;
+    Encoder encoder = Encoder::Auto;
+    Speed speed = Speed::Fast;
+    /// RemoteFX quality, 0 to 100. 100 keeps every detail, 50 is the MS default.
+    int remoteFxQuality = 100;
+
+    /// Build settings from the strings in krdpserverrc. Unknown values keep the default.
+    static VideoEncoderSettings fromStrings(const QString &codec, const QString &encoder, const QString &speed, int remoteFxQuality);
+};
+
+/**
  * A class that encapsulates an RdpGfx video stream.
  *
  * Video streaming is done using the "RDP Graphics Pipeline" protocol
@@ -45,14 +77,20 @@ class KRDP_EXPORT VideoStream : public QObject
 
 public:
     enum class EncodingMode {
-        H264,
+        H264, ///< AVC420 packets from KPipeWire
         Progressive,
+        AVC420, ///< raw frames encoded by FreeRDP
+        AVC444,
     };
 
     explicit VideoStream(RdpConnection *session);
     ~VideoStream() override;
 
     static bool h264Disabled();
+    static void setEncoderSettings(const VideoEncoderSettings &settings);
+    static const VideoEncoderSettings &encoderSettings();
+    /// Whether the settings allow AVC444, so the server can advertise it.
+    static bool avc444Allowed();
 
     bool initialize();
     void close();

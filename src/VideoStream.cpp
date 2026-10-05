@@ -22,6 +22,7 @@
 #include <QQueue>
 #include <QSet>
 
+#include <freerdp/codec/h264.h>
 #include <freerdp/freerdp.h>
 #include <freerdp/peer.h>
 #include <freerdp/update.h>
@@ -51,6 +52,32 @@ constexpr qsizetype HighQueueCount = 3; // Level of frames in the pending-send q
 constexpr qsizetype LowQueueCount = 1; // Level of frames in the pending-send queue that resumes the encoder
 
 constexpr uint32_t ProgressiveCodecContextId = 1;
+
+// RemoteFX quantization, in the order LL3, LH3, HL3, HH3, LH2, HL2, HH2, LH1, HL1, HH1.
+// 6 keeps a band at full precision; each step above halves it. The finest bands (the
+// last three) carry text edges.
+static std::array<UINT32, 10> remoteFxQuantization(int quality)
+{
+    if (quality >= 90) {
+        return {6, 6, 6, 6, 6, 6, 6, 6, 6, 6};
+    }
+    if (quality >= 70) {
+        return {6, 6, 6, 6, 6, 6, 7, 7, 7, 8};
+    }
+    if (quality >= 50) {
+        return {6, 6, 6, 6, 7, 7, 8, 8, 8, 9}; // the MS default
+    }
+    if (quality >= 30) {
+        return {7, 7, 7, 7, 8, 8, 9, 9, 9, 10};
+    }
+    return {8, 8, 8, 8, 9, 9, 10, 10, 10, 11};
+}
+
+// H.264 constant QP for the FreeRDP encoders: quality 100 gives QP 12, 50 gives QP 26.
+static quint32 h264QpForQuality(int quality)
+{
+    return quint32(std::clamp(int(std::lround(40.0 - quality * 0.28)), 10, 45));
+}
 
 constexpr clk::system_clock::duration QualityUpdateInterval = clk::milliseconds(1500);
 constexpr int MinAdaptiveQuality = 10;
@@ -83,6 +110,7 @@ struct RdpCapsInformation {
     RDPGFX_CAPSET capSet;
     bool avcSupported : 1 = false;
     bool yuv420Supported : 1 = false;
+    bool avc444Supported : 1 = false;
 };
 
 const char *capVersionToString(uint32_t version)
@@ -144,6 +172,9 @@ class KRDP_NO_EXPORT VideoStream::Private
 public:
     using RdpGfxContextPtr = std::unique_ptr<RdpgfxServerContext, decltype(&rdpgfx_server_context_free)>;
     using ProgressiveContextPtr = std::unique_ptr<PROGRESSIVE_CONTEXT, decltype(&progressive_context_free)>;
+    using H264ContextPtr = std::unique_ptr<H264_CONTEXT, decltype(&h264_context_free)>;
+
+    bool ensureH264(const QSize &size);
 
     RdpConnection *session;
     std::optional<EncodingMode> activeEncodingMode;
@@ -151,6 +182,15 @@ public:
 
     RdpGfxContextPtr gfxContext = RdpGfxContextPtr(nullptr, rdpgfx_server_context_free);
     ProgressiveContextPtr progressive = ProgressiveContextPtr(nullptr, progressive_context_free);
+
+    // FreeRDP H.264 encoder for AVC420/AVC444. Only the frame submission thread touches it;
+    // other threads ask for changes through the atomics below.
+    H264ContextPtr h264 = H264ContextPtr(nullptr, h264_context_free);
+    QSize h264Size;
+    quint32 h264Qp = 0;
+    bool nvencFailed = false;
+    std::atomic_bool h264Recreate = false;
+    std::atomic<quint32> h264TargetQp = h264QpForQuality(100);
 
     uint32_t frameId = 0;
     uint32_t channelId = 0;
@@ -193,14 +233,131 @@ static QString encodingModeName(VideoStream::EncodingMode mode)
         return QStringLiteral("h264");
     case VideoStream::EncodingMode::Progressive:
         return QStringLiteral("progressive");
+    case VideoStream::EncodingMode::AVC420:
+        return QStringLiteral("avc420");
+    case VideoStream::EncodingMode::AVC444:
+        return QStringLiteral("avc444");
     }
     Q_UNREACHABLE();
+}
+
+static bool usesFreeRdpH264(std::optional<VideoStream::EncodingMode> mode)
+{
+    return mode == VideoStream::EncodingMode::AVC420 || mode == VideoStream::EncodingMode::AVC444;
+}
+
+static VideoEncoderSettings s_encoderSettings;
+
+VideoEncoderSettings VideoEncoderSettings::fromStrings(const QString &codec, const QString &encoder, const QString &speed, int remoteFxQuality)
+{
+    VideoEncoderSettings settings;
+    const auto is = [](const QString &value, QLatin1StringView name) {
+        return value.compare(name, Qt::CaseInsensitive) == 0;
+    };
+
+    if (is(codec, QLatin1StringView("Auto"))) {
+        settings.codec = Codec::Auto;
+    } else if (is(codec, QLatin1StringView("AVC444"))) {
+        settings.codec = Codec::AVC444;
+    } else if (is(codec, QLatin1StringView("AVC420"))) {
+        settings.codec = Codec::AVC420;
+    } else if (is(codec, QLatin1StringView("RemoteFX"))) {
+        settings.codec = Codec::RemoteFX;
+    } else if (!codec.isEmpty() && !is(codec, QLatin1StringView("KPipeWire"))) {
+        qCWarning(KRDP) << "Unknown VideoCodec" << codec << "- using KPipeWire";
+    }
+
+    if (is(encoder, QLatin1StringView("NVENC"))) {
+        settings.encoder = Encoder::NVENC;
+    } else if (is(encoder, QLatin1StringView("libx264"))) {
+        settings.encoder = Encoder::Libx264;
+    } else if (!encoder.isEmpty() && !is(encoder, QLatin1StringView("Auto"))) {
+        qCWarning(KRDP) << "Unknown VideoEncoder" << encoder << "- using Auto";
+    }
+
+    if (is(speed, QLatin1StringView("Default"))) {
+        settings.speed = Speed::Default;
+    } else if (is(speed, QLatin1StringView("Fastest"))) {
+        settings.speed = Speed::Fastest;
+    } else if (!speed.isEmpty() && !is(speed, QLatin1StringView("Fast"))) {
+        qCWarning(KRDP) << "Unknown EncoderSpeed" << speed << "- using Fast";
+    }
+
+    settings.remoteFxQuality = std::clamp(remoteFxQuality, 0, 100);
+    return settings;
+}
+
+void VideoStream::setEncoderSettings(const VideoEncoderSettings &settings)
+{
+    s_encoderSettings = settings;
+}
+
+const VideoEncoderSettings &VideoStream::encoderSettings()
+{
+    return s_encoderSettings;
 }
 
 bool VideoStream::h264Disabled()
 {
     static const bool h264Disabled = qEnvironmentVariableIntValue("KRDP_DISABLE_H264") != 0;
-    return h264Disabled;
+    return h264Disabled || s_encoderSettings.codec == VideoEncoderSettings::Codec::RemoteFX;
+}
+
+bool VideoStream::avc444Allowed()
+{
+    return !h264Disabled() && (s_encoderSettings.codec == VideoEncoderSettings::Codec::Auto || s_encoderSettings.codec == VideoEncoderSettings::Codec::AVC444);
+}
+
+bool VideoStream::Private::ensureH264(const QSize &size)
+{
+    if (h264Recreate.exchange(false)) {
+        h264.reset();
+    }
+
+    const auto &settings = s_encoderSettings;
+    if (!h264) {
+        h264.reset(h264_context_new(TRUE));
+        if (!h264) {
+            qCWarning(KRDP) << "Failed to create H.264 encoder context";
+            return false;
+        }
+
+        const bool nvenc = settings.encoder == VideoEncoderSettings::Encoder::NVENC
+            || (settings.encoder == VideoEncoderSettings::Encoder::Auto && !nvencFailed);
+        H264_ENCODER_SPEED speed = H264_ENCODER_SPEED_FAST;
+        if (settings.speed == VideoEncoderSettings::Speed::Default) {
+            speed = H264_ENCODER_SPEED_DEFAULT;
+        } else if (settings.speed == VideoEncoderSettings::Speed::Fastest) {
+            speed = H264_ENCODER_SPEED_FASTEST;
+        }
+        if (!h264_context_set_option(h264.get(), H264_CONTEXT_OPTION_ENCODER, nvenc ? H264_ENCODER_NVENC : H264_ENCODER_LIBX264)
+            || !h264_context_set_option(h264.get(), H264_CONTEXT_OPTION_ENCODER_SPEED, speed)) {
+            qCWarning(KRDP) << "This FreeRDP cannot choose the H.264 encoder; build KRDP against the krdp-local FreeRDP";
+        }
+        qCDebug(KRDP) << "H.264 encoder:" << (nvenc ? "NVENC" : "libx264");
+        h264Size = QSize();
+    }
+
+    const quint32 qp = h264TargetQp.load();
+    if (h264Size == size && h264Qp == qp) {
+        return true;
+    }
+
+    // A reset opens a new encoder, so it also applies the new QP; the next frame is a key frame.
+    if (!h264_context_reset(h264.get(), size.width(), size.height())) {
+        qCWarning(KRDP) << "Failed to reset H.264 encoder for size" << size;
+        h264.reset();
+        return false;
+    }
+    if (!h264_context_set_option(h264.get(), H264_CONTEXT_OPTION_RATECONTROL, H264_RATECONTROL_CQP)
+        || !h264_context_set_option(h264.get(), H264_CONTEXT_OPTION_QP, qp)
+        || !h264_context_set_option(h264.get(), H264_CONTEXT_OPTION_FRAMERATE, quint32(requestedFrameRate.load()))
+        || !h264_context_set_option(h264.get(), H264_CONTEXT_OPTION_USAGETYPE, H264_SCREEN_CONTENT_REAL_TIME)) {
+        qCWarning(KRDP) << "Failed to configure H.264 encoder";
+    }
+    h264Size = size;
+    h264Qp = qp;
+    return true;
 }
 
 VideoStream::VideoStream(RdpConnection *session)
@@ -223,6 +380,10 @@ void VideoStream::setActiveEncodingMode(EncodingMode mode)
     }
     d->surface->setActiveEncodingMode(mode, d->quality, d->requestedFrameRate.load());
     d->activeEncodingMode = mode;
+    if (usesFreeRdpH264(mode)) {
+        // A new stream needs a new encoder, so the client gets a key frame first.
+        d->h264Recreate = true;
+    }
 }
 
 void VideoStream::setSize(const QSize &newSize)
@@ -281,6 +442,10 @@ bool VideoStream::initialize()
         d->gfxContext.reset();
         return false;
     }
+    const auto quantization = remoteFxQuantization(encoderSettings().remoteFxQuality);
+    if (!progressive_context_set_quantization_values(d->progressive.get(), quantization.data(), quantization.size())) {
+        qCWarning(KRDP) << "Failed to set RemoteFX quality" << encoderSettings().remoteFxQuality;
+    }
 
     d->initialized = true;
 
@@ -313,7 +478,8 @@ bool VideoStream::initialize()
         }
     });
 
-    qCDebug(KRDP) << "Video stream initialized with H.264" << (h264Disabled() ? "disabled" : "enabled");
+    qCDebug(KRDP) << "Video stream initialized with H.264" << (h264Disabled() ? "disabled" : "enabled") << "codec setting"
+                  << int(encoderSettings().codec) << "RemoteFX quality" << encoderSettings().remoteFxQuality;
 
     return true;
 }
@@ -368,9 +534,9 @@ void VideoStream::queueFrame(const KRdp::VideoFrame &frame)
             d->frameQueue.clear();
         }
         d->frameQueue.append(frame);
-    } else if (d->activeEncodingMode == EncodingMode::Progressive) {
+    } else if (d->activeEncodingMode) {
         std::lock_guard lock(d->frameQueueMutex);
-        // for the raster path we only need to keep the latest frame, but accumulate damage
+        // for the raw frame paths we only need to keep the latest frame, but accumulate damage
         QRegion lastDamage;
         if (!d->frameQueue.isEmpty()) {
             lastDamage = d->frameQueue.last().damage;
@@ -416,6 +582,7 @@ void VideoStream::setStreamingEnabled(bool enabled)
 void VideoStream::applyQuality()
 {
     d->surface->setVideoQuality(d->quality);
+    d->h264TargetQp = h264QpForQuality(d->quality);
 }
 
 void VideoStream::setVideoQuality(quint8 quality)
@@ -439,7 +606,7 @@ void VideoStream::setAdaptiveQuality(bool enabled)
 
 void VideoStream::seedQuality(quint8 quality)
 {
-    if (!d->adaptiveQuality || d->activeEncodingMode != EncodingMode::H264) {
+    if (!d->adaptiveQuality || (d->activeEncodingMode != EncodingMode::H264 && !usesFreeRdpH264(d->activeEncodingMode))) {
         return;
     }
     const quint8 hi = std::max<quint8>(d->qualityCap, quint8(MinAdaptiveQuality));
@@ -510,6 +677,8 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         case RDPGFX_CAPVERSION_10:
             if (!(set.flags & RDPGFX_CAPS_FLAG_AVC_DISABLED)) {
                 caps.avcSupported = true;
+                // A thin client asks for AVC420 only.
+                caps.avc444Supported = !(set.flags & RDPGFX_CAPS_FLAG_AVC_THINCLIENT);
             }
             break;
         case RDPGFX_CAPVERSION_81:
@@ -523,7 +692,7 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         }
 
         qCDebug(KRDP) << " " << capVersionToString(caps.version) << "flags:" << Qt::hex << set.flags << Qt::dec << "AVC:" << caps.avcSupported
-                      << "YUV420:" << caps.yuv420Supported;
+                      << "YUV420:" << caps.yuv420Supported << "AVC444:" << caps.avc444Supported;
 
         capsInformation.push_back(caps);
     }
@@ -534,9 +703,28 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         return caps.avcSupported && caps.yuv420Supported;
     });
 
+    auto maxVersion = std::max_element(capsInformation.begin(), capsInformation.end(), [](const auto &first, const auto &second) {
+        return first.version < second.version;
+    });
+    // AVC444 is only possible with the caps set we confirm, which is the highest one.
+    const bool supportsAvc444 = maxVersion != capsInformation.end() && maxVersion->avcSupported && maxVersion->avc444Supported;
+
     EncodingMode negotiatedMode = EncodingMode::Progressive;
     if (!h264Disabled() && supportsH264) {
-        negotiatedMode = EncodingMode::H264;
+        switch (encoderSettings().codec) {
+        case VideoEncoderSettings::Codec::KPipeWire:
+            negotiatedMode = EncodingMode::H264;
+            break;
+        case VideoEncoderSettings::Codec::Auto:
+        case VideoEncoderSettings::Codec::AVC444:
+            negotiatedMode = supportsAvc444 ? EncodingMode::AVC444 : EncodingMode::AVC420;
+            break;
+        case VideoEncoderSettings::Codec::AVC420:
+            negotiatedMode = EncodingMode::AVC420;
+            break;
+        case VideoEncoderSettings::Codec::RemoteFX:
+            break;
+        }
     } else if (!supportsProgresive) {
         qCWarning(KRDP) << "Client advertised no usable graphics capability sets";
         d->session->close(RdpConnection::CloseReason::VideoInitFailed);
@@ -556,10 +744,6 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         },
         Qt::BlockingQueuedConnection); // RDP callbacks are on the connection thread, VideoStream operates on the main thread
     qCDebug(KRDP) << "Selected encoding mode:" << encodingModeName(negotiatedMode);
-
-    auto maxVersion = std::max_element(capsInformation.begin(), capsInformation.end(), [](const auto &first, const auto &second) {
-        return first.version < second.version;
-    });
 
     qCDebug(KRDP) << "Selected caps:" << capVersionToString(maxVersion->version);
 
@@ -805,7 +989,7 @@ void VideoStream::updateInFlightWindow()
 
 void VideoStream::updateAdaptiveQuality()
 {
-    if (!d->adaptiveQuality || d->activeEncodingMode != EncodingMode::H264) {
+    if (!d->adaptiveQuality || (d->activeEncodingMode != EncodingMode::H264 && !usesFreeRdpH264(d->activeEncodingMode))) {
         return;
     }
 
@@ -892,6 +1076,17 @@ void VideoStream::sendFrame(const VideoFrame &frame)
     bool submitted = false;
     if (d->activeEncodingMode == EncodingMode::H264) {
         submitted = d->surface->sendFrameH264(d->gfxContext.get(), frameId, frame);
+    } else if (usesFreeRdpH264(d->activeEncodingMode)) {
+        if (d->ensureH264(frame.size)) {
+            const bool avc444 = d->activeEncodingMode == EncodingMode::AVC444;
+            const auto result = d->surface->sendFrameAvc(d->gfxContext.get(), d->h264.get(), avc444, frameId, frame);
+            submitted = result == VideoStreamSurface::AvcResult::Sent;
+            if (result == VideoStreamSurface::AvcResult::Failed && encoderSettings().encoder == VideoEncoderSettings::Encoder::Auto && !d->nvencFailed) {
+                qCWarning(KRDP) << "H.264 encoding failed with NVENC; switching to libx264";
+                d->nvencFailed = true;
+                d->h264Recreate = true;
+            }
+        }
     } else {
         submitted = d->surface->sendFrameProgressive(d->gfxContext.get(), d->progressive.get(), frameId, frame);
     }

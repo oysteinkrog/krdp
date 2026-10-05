@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <optional>
+#include <utility>
 
 #include <unistd.h>
 
@@ -326,6 +327,102 @@ bool VideoStreamSurface::sendFrameH264(RdpgfxServerContext *gfxContext, uint32_t
     }
 
     return true;
+}
+
+VideoStreamSurface::AvcResult
+VideoStreamSurface::sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *h264, bool avc444, uint32_t frameId, const VideoFrame &frame)
+{
+    if (frame.image.isNull()) {
+        return AvcResult::Unchanged;
+    }
+
+    if (surface.id == 0) {
+        qCWarning(KRDP) << "No graphics surface available for AVC frame submission";
+        return AvcResult::Unchanged;
+    }
+
+    const QImage image = frame.image.convertToFormat(QImage::Format_RGB32);
+    const auto width = static_cast<UINT16>(image.width());
+    const auto height = static_cast<UINT16>(image.height());
+    // Always convert the whole frame: FreeRDP alternates between two YUV buffers, so a
+    // partial update would leave the rest of the picture two frames old. FreeRDP compares
+    // the new picture with the previous one and only lists the changed areas.
+    const RECTANGLE_16 regionRect = {0, 0, width, height};
+
+    RDPGFX_START_FRAME_PDU startFramePdu = {};
+    RDPGFX_END_FRAME_PDU endFramePdu = {};
+    const auto now = QDateTime::currentDateTimeUtc().time();
+    startFramePdu.timestamp = now.hour() << 22 | now.minute() << 16 | now.second() << 10 | now.msec();
+    startFramePdu.frameId = frameId;
+    endFramePdu.frameId = frameId;
+
+    RDPGFX_SURFACE_COMMAND surfaceCommand = {};
+    surfaceCommand.surfaceId = surface.id;
+    surfaceCommand.contextId = 0;
+    surfaceCommand.format = PIXEL_FORMAT_BGRX32;
+    surfaceCommand.right = width;
+    surfaceCommand.bottom = height;
+    surfaceCommand.width = width;
+    surfaceCommand.height = height;
+
+    INT32 rc = 0;
+    RDPGFX_AVC420_BITMAP_STREAM avc420 = {};
+    RDPGFX_AVC444_BITMAP_STREAM avc444Stream = {};
+    if (avc444) {
+        rc = avc444_compress(h264,
+                             image.constBits(),
+                             PIXEL_FORMAT_BGRX32,
+                             image.bytesPerLine(),
+                             width,
+                             height,
+                             2, // AVC444v2
+                             &regionRect,
+                             &avc444Stream.LC,
+                             &avc444Stream.bitstream[0].data,
+                             &avc444Stream.bitstream[0].length,
+                             &avc444Stream.bitstream[1].data,
+                             &avc444Stream.bitstream[1].length,
+                             &avc444Stream.bitstream[0].meta,
+                             &avc444Stream.bitstream[1].meta);
+        if (rc > 0 && avc444Stream.LC == 2) {
+            // Chroma only: [MS-RDPEGFX] 2.2.4.5 puts the chroma frame in the first
+            // bitstream, but avc444_compress returns it as the second one.
+            std::swap(avc444Stream.bitstream[0], avc444Stream.bitstream[1]);
+        }
+        // Size of the first stream as written on the wire: numRegionRects, then 8 bytes of
+        // rectangle and 2 of quant/quality per region, then the H.264 data.
+        avc444Stream.cbAvc420EncodedBitstream1 = 4 + 10 * avc444Stream.bitstream[0].meta.numRegionRects + avc444Stream.bitstream[0].length;
+        surfaceCommand.codecId = RDPGFX_CODECID_AVC444v2;
+        surfaceCommand.extra = &avc444Stream;
+    } else {
+        rc = avc420_compress(h264, image.constBits(), PIXEL_FORMAT_BGRX32, image.bytesPerLine(), width, height, &regionRect, &avc420.data, &avc420.length, &avc420.meta);
+        surfaceCommand.codecId = RDPGFX_CODECID_AVC420;
+        surfaceCommand.extra = &avc420;
+    }
+
+    const auto freeMetablocks = [&]() {
+        free_h264_metablock(&avc420.meta);
+        free_h264_metablock(&avc444Stream.bitstream[0].meta);
+        free_h264_metablock(&avc444Stream.bitstream[1].meta);
+    };
+
+    if (rc < 0) {
+        qCWarning(KRDP) << (avc444 ? "avc444_compress" : "avc420_compress") << "failed" << rc << "size" << frame.size;
+        freeMetablocks();
+        return AvcResult::Failed;
+    }
+    if (rc == 0) {
+        freeMetablocks();
+        return AvcResult::Unchanged;
+    }
+
+    const UINT status = gfxContext->SurfaceFrameCommand(gfxContext, &surfaceCommand, &startFramePdu, &endFramePdu);
+    if (status != CHANNEL_RC_OK) {
+        qCWarning(KRDP) << "SurfaceFrameCommand failed" << status << "frameId" << frameId << "surface" << surface.id << (avc444 ? "AVC444" : "AVC420");
+    }
+
+    freeMetablocks();
+    return AvcResult::Sent;
 }
 
 bool VideoStreamSurface::sendFrameProgressive(RdpgfxServerContext *gfxContext, PROGRESSIVE_CONTEXT *progressive, uint32_t frameId, const VideoFrame &frame)

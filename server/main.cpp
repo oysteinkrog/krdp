@@ -18,6 +18,7 @@
 
 #include "Server.h"
 #include "SessionController.h"
+#include "VideoStream.h"
 #include "krdp_version.h"
 #include "krdpserversettings.h"
 
@@ -171,6 +172,9 @@ int main(int argc, char **argv)
     } else {
         controller.setOperationMode(config->exclusiveMode() ? SessionController::OperationMode::RemoteAccess : SessionController::OperationMode::SharedAccess);
     }
+
+    KRdp::VideoStream::setEncoderSettings(
+        KRdp::VideoEncoderSettings::fromStrings(config->videoCodec(), config->videoEncoder(), config->encoderSpeed(), config->remoteFxQuality()));
 
     if (!server.start()) {
         return -1;

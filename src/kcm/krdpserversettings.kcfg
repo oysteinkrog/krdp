@@ -32,6 +32,24 @@ SPDX-License-Identifier: BSD-2-Clause
       <label>Adjust the video quality at runtime based on the client's network conditions, up to Quality.</label>
       <default>true</default>
     </entry>
+    <entry name="videoCodec" key="VideoCodec" type="String">
+      <label>Video codec: KPipeWire (H.264 4:2:0 from KPipeWire), Auto (AVC444 if the client supports it, else AVC420, else RemoteFX), AVC444, AVC420 or RemoteFX</label>
+      <default>KPipeWire</default>
+    </entry>
+    <entry name="videoEncoder" key="VideoEncoder" type="String">
+      <label>H.264 encoder for the AVC444 and AVC420 codecs: Auto (NVENC, else libx264), NVENC or libx264</label>
+      <default>Auto</default>
+    </entry>
+    <entry name="encoderSpeed" key="EncoderSpeed" type="String">
+      <label>H.264 encoder speed preset for the AVC444 and AVC420 codecs: Default, Fast or Fastest</label>
+      <default>Fast</default>
+    </entry>
+    <entry name="remoteFxQuality" key="RemoteFXQuality" type="Int">
+      <label>RemoteFX quality from 0 to 100. 100 keeps every detail, 50 is the Windows default.</label>
+      <default>100</default>
+      <min>0</min>
+      <max>100</max>
+    </entry>
     <entry name="Users" type="StringList">
       <label>Users allowed to login, passwords are stored in KWallet</label>
     </entry>
