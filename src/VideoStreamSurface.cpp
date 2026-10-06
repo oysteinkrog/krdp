@@ -279,7 +279,7 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
     queueFrame(frameData);
 }
 
-bool VideoStreamSurface::sendFrameH264(RdpgfxServerContext *gfxContext, uint32_t frameId, const VideoFrame &frame)
+bool VideoStreamSurface::sendFrameH264(RdpgfxServerContext *gfxContext, uint32_t frameId, const VideoFrame &frame, quint64 resetGeneration)
 {
     if (frame.data.isEmpty()) {
         return false;
@@ -319,6 +319,11 @@ bool VideoStreamSurface::sendFrameH264(RdpgfxServerContext *gfxContext, uint32_t
     RDPGFX_H264_QUANT_QUALITY quality = {22, 0, 100};
     avcStream.meta.quantQualityVals = &quality;
 
+    if (this->resetGeneration != resetGeneration) {
+        qCDebug(KRDP) << "Client reset its graphics; dropping frame" << frameId;
+        return false;
+    }
+
     const UINT startStatus = gfxContext->StartFrame(gfxContext, &startFramePdu);
     if (startStatus != CHANNEL_RC_OK) {
         qCWarning(KRDP) << "StartFrame failed" << startStatus << "frameId" << frameId;
@@ -339,7 +344,7 @@ bool VideoStreamSurface::sendFrameH264(RdpgfxServerContext *gfxContext, uint32_t
 }
 
 VideoStreamSurface::AvcResult
-VideoStreamSurface::sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *h264, bool avc444, uint32_t frameId, const VideoFrame &frame)
+VideoStreamSurface::sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *h264, bool avc444, uint32_t frameId, const VideoFrame &frame, quint64 resetGeneration)
 {
     if (frame.image.isNull()) {
         return AvcResult::Unchanged;
@@ -441,23 +446,29 @@ VideoStreamSurface::sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *
                 .arg(qChecksum(data));
         };
         if (avc444) {
-            qCDebug(KRDP) << "AVC frame" << frameId << "surface" << surface.id << "AVC444v2 LC" << avc444Stream.LC << "cb1" << avc444Stream.cbAvc420EncodedBitstream1
+            qCDebug(KRDP) << "AVC frame" << frameId << "surface" << surfaceCommand.surfaceId << "AVC444v2 LC" << avc444Stream.LC << "cb1" << avc444Stream.cbAvc420EncodedBitstream1
                           << "bs1:" << describe(avc444Stream.bitstream[0]) << "bs2:" << describe(avc444Stream.bitstream[1]);
         } else {
-            qCDebug(KRDP) << "AVC frame" << frameId << "surface" << surface.id << "AVC420" << describe(avc420);
+            qCDebug(KRDP) << "AVC frame" << frameId << "surface" << surfaceCommand.surfaceId << "AVC420" << describe(avc420);
         }
+    }
+
+    if (this->resetGeneration != resetGeneration) {
+        qCDebug(KRDP) << "Client reset its graphics while frame" << frameId << "was encoded; dropping it";
+        freeMetablocks();
+        return AvcResult::Stale;
     }
 
     const UINT status = gfxContext->SurfaceFrameCommand(gfxContext, &surfaceCommand, &startFramePdu, &endFramePdu);
     if (status != CHANNEL_RC_OK) {
-        qCWarning(KRDP) << "SurfaceFrameCommand failed" << status << "frameId" << frameId << "surface" << surface.id << (avc444 ? "AVC444" : "AVC420");
+        qCWarning(KRDP) << "SurfaceFrameCommand failed" << status << "frameId" << frameId << "surface" << surfaceCommand.surfaceId << (avc444 ? "AVC444" : "AVC420");
     }
 
     freeMetablocks();
     return AvcResult::Sent;
 }
 
-bool VideoStreamSurface::sendFrameProgressive(RdpgfxServerContext *gfxContext, PROGRESSIVE_CONTEXT *progressive, uint32_t frameId, const VideoFrame &frame)
+bool VideoStreamSurface::sendFrameProgressive(RdpgfxServerContext *gfxContext, PROGRESSIVE_CONTEXT *progressive, uint32_t frameId, const VideoFrame &frame, quint64 resetGeneration)
 {
     if (frame.image.isNull()) {
         return false;
@@ -518,6 +529,12 @@ bool VideoStreamSurface::sendFrameProgressive(RdpgfxServerContext *gfxContext, P
     surfaceCommand.height = frame.size.height();
     surfaceCommand.length = encodedSize;
     surfaceCommand.data = encodedData;
+
+    if (this->resetGeneration != resetGeneration) {
+        qCDebug(KRDP) << "Client reset its graphics while frame" << frameId << "was encoded; dropping it";
+        region16_uninit(&*invalidRegion);
+        return false;
+    }
 
     const UINT status = gfxContext->SurfaceFrameCommand(gfxContext, &surfaceCommand, &startFramePdu, &endFramePdu);
     if (status != CHANNEL_RC_OK) {

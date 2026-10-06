@@ -654,16 +654,24 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
     // caps, this is a GFX channel reset — clear surface state so
     // surfaces get re-created on the next frame.
     const bool readvertised = d->capsConfirmed;
+    std::unique_lock frameLock(d->surface->frameMutex, std::defer_lock);
     if (d->capsConfirmed) {
         qCDebug(KRDP) << "GFX channel reset (re-advertisement), resetting surface state";
+        // Tell a frame that is being encoded not to send, then wait for it to finish.
+        ++d->surface->resetGeneration;
+        frameLock.lock();
         d->capsConfirmed = false;
         d->surface->pendingReset = true;
         // A client that re-advertises has already dropped its GFX state. Sending it
         // DeleteSurface or DeleteEncodingContext for surfaces it no longer knows makes
         // mstsc stop acknowledging frames (black screen), so only forget them locally.
         forgetSurface();
-        std::lock_guard lock(d->pendingFramesMutex);
-        d->pendingFrames.clear();
+        {
+            std::lock_guard lock(d->pendingFramesMutex);
+            d->pendingFrames.clear();
+        }
+        // Not held across the blocking call to the main thread below.
+        frameLock.unlock();
     }
 
     auto capsSets = capsAdvertise->capsSets;
@@ -1091,6 +1099,8 @@ void VideoStream::sendFrame(const VideoFrame &frame)
         return;
     }
 
+    std::lock_guard frameLock(d->surface->frameMutex);
+    const quint64 resetGeneration = d->surface->resetGeneration;
     if (!d->gfxContext || !d->capsConfirmed) {
         return;
     }
@@ -1125,11 +1135,11 @@ void VideoStream::sendFrame(const VideoFrame &frame)
 
     bool submitted = false;
     if (d->activeEncodingMode == EncodingMode::H264) {
-        submitted = d->surface->sendFrameH264(d->gfxContext.get(), frameId, frame);
+        submitted = d->surface->sendFrameH264(d->gfxContext.get(), frameId, frame, resetGeneration);
     } else if (usesFreeRdpH264(d->activeEncodingMode)) {
         if (d->ensureH264(frame.size)) {
             const bool avc444 = d->activeEncodingMode == EncodingMode::AVC444;
-            const auto result = d->surface->sendFrameAvc(d->gfxContext.get(), d->h264.get(), avc444, frameId, frame);
+            const auto result = d->surface->sendFrameAvc(d->gfxContext.get(), d->h264.get(), avc444, frameId, frame, resetGeneration);
             submitted = result == VideoStreamSurface::AvcResult::Sent;
             if (result == VideoStreamSurface::AvcResult::Failed && encoderSettings().encoder == VideoEncoderSettings::Encoder::Auto && !d->nvencFailed) {
                 qCWarning(KRDP) << "H.264 encoding failed with NVENC; switching to libx264";
@@ -1138,7 +1148,7 @@ void VideoStream::sendFrame(const VideoFrame &frame)
             }
         }
     } else {
-        submitted = d->surface->sendFrameProgressive(d->gfxContext.get(), d->progressive.get(), frameId, frame);
+        submitted = d->surface->sendFrameProgressive(d->gfxContext.get(), d->progressive.get(), frameId, frame, resetGeneration);
     }
 
     if (!submitted) {
