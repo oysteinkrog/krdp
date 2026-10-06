@@ -498,6 +498,7 @@ VideoStreamSurface::sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *
         freeMetablocks();
         return AvcResult::Unchanged;
     }
+    lastFrameBytes = avc444 ? avc444Stream.bitstream[0].length + avc444Stream.bitstream[1].length : avc420.length;
 
     if (KRDP().isDebugEnabled() && frameId < 3) {
         const auto describe = [](const RDPGFX_AVC420_BITMAP_STREAM &bs) {
@@ -667,6 +668,7 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
     if (status != CHANNEL_RC_OK) {
         qCWarning(KRDP) << "SurfaceFrameCommand failed" << status << "frameId" << frameId << "surface" << surfaceCommand.surfaceId << "GPU AVC444";
     }
+    lastFrameBytes = quint32(lumaData.size() + chromaData.size());
     gpuLumaSent = gpuLumaSent || !lumaData.isEmpty();
     gpuChromaSent = gpuChromaSent || !chromaData.isEmpty();
     return AvcResult::Sent;

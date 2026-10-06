@@ -63,6 +63,9 @@ bool GpuH264Encoder::ensure(const AVFrame *frame, quint32 qp, int frameRate, Spe
     m_context->pix_fmt = AV_PIX_FMT_CUDA;
     m_context->hw_frames_ctx = av_buffer_ref(frame->hw_frames_ctx);
     m_context->max_b_frames = 0;
+    // FFmpeg leaves the GOP to the preset (g = -1), and with tune ull NVENC never inserts a
+    // periodic key frame. That is what we want: every reset of the client's graphics opens a
+    // new encoder, which starts with one. tools/gpuavc444test checks it.
     m_context->delay = 0;
     m_context->flags |= AV_CODEC_FLAG_LOOP_FILTER;
     const char *preset = speed == Speed::Fastest ? "p1" : speed == Speed::Fast ? "p3" : "p4";
@@ -109,6 +112,9 @@ bool GpuH264Encoder::encode(AVFrame *frame, QByteArray &out)
         if (rc < 0) {
             qCWarning(KRDP) << "GPU encode: avcodec_receive_packet failed";
             return false;
+        }
+        if ((m_packet->flags & AV_PKT_FLAG_KEY) && m_pts > 1) {
+            qCDebug(KRDP) << "GPU encode: key frame at picture" << m_pts - 1 << "bytes" << m_packet->size;
         }
         out.append(reinterpret_cast<const char *>(m_packet->data), m_packet->size);
         av_packet_unref(m_packet);

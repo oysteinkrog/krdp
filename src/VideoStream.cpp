@@ -216,7 +216,12 @@ public:
     std::jthread frameSubmissionThread;
     std::mutex frameQueueMutex;
     QQueue<VideoFrame> frameQueue;
-    QHash<uint32_t, clk::steady_clock::time_point> pendingFrames; // frame id -> time it was sent
+    struct PendingFrame {
+        clk::steady_clock::time_point sent; // encode start, then the time it was sent
+        quint32 bytes = 0; // encoded size; 0 if the path does not report it
+        qsizetype inFlight = 0; // frames in flight when it was sent, itself included
+    };
+    QHash<uint32_t, PendingFrame> pendingFrames; // by frame id
     std::mutex pendingFramesMutex;
 
     // Latency statistics for the debug log, guarded by pendingFramesMutex. See logLatencyStats().
@@ -229,6 +234,11 @@ public:
         clk::microseconds ackTotal{0};
         clk::microseconds ackMax{0};
         uint32_t queueDepth = 0;
+        quint64 bytesTotal = 0;
+        quint32 bytesMax = 0;
+        // Acknowledgement time by frame size: below 64 kB, below 256 kB, and larger.
+        std::array<int, 3> sizeAcks{};
+        std::array<clk::microseconds, 3> sizeAckTotal{};
     } latency;
     void logLatencyStats(clk::steady_clock::time_point now);
 
@@ -829,6 +839,17 @@ void VideoStream::Private::logLatencyStats(clk::steady_clock::time_point now)
                             << ms(latency.frames ? latency.encodeTotal / latency.frames : clk::microseconds(0)) << "ms max" << ms(latency.encodeMax)
                             << "ms, send to ack avg" << ms(latency.acks ? latency.ackTotal / latency.acks : clk::microseconds(0)) << "ms max"
                             << ms(latency.ackMax) << "ms, in flight" << pendingFrames.size() << "client queue" << latency.queueDepth;
+    if (latency.bytesTotal > 0) {
+        QString bySize;
+        static constexpr const char *sizeNames[] = {"<64k", "<256k", ">=256k"};
+        for (size_t i = 0; i < latency.sizeAcks.size(); ++i) {
+            if (latency.sizeAcks[i] > 0) {
+                bySize += QStringLiteral(" %1: %2x %3ms").arg(QLatin1StringView(sizeNames[i])).arg(latency.sizeAcks[i]).arg(ms(latency.sizeAckTotal[i] / latency.sizeAcks[i]));
+            }
+        }
+        qCDebug(KRDP).noquote() << "Video bytes: avg" << (latency.frames ? latency.bytesTotal / latency.frames / 1024 : 0) << "kB max" << latency.bytesMax / 1024
+                                << "kB," << QString::number(latency.bytesTotal * 8.0 / seconds / 1e6, 'f', 1) << "Mbit/s; ack by size" << bySize;
+    }
     latency = LatencyStats{};
     latency.windowStart = now;
 }
@@ -847,11 +868,20 @@ uint32_t VideoStream::onFrameAcknowledge(const RDPGFX_FRAME_ACKNOWLEDGE_PDU *fra
 
     if (KRDP().isDebugEnabled()) {
         const auto now = clk::steady_clock::now();
-        const auto ackTime = clk::duration_cast<clk::microseconds>(now - itr.value());
+        const auto ackTime = clk::duration_cast<clk::microseconds>(now - itr->sent);
         d->latency.acks++;
         d->latency.ackTotal += ackTime;
         d->latency.ackMax = std::max(d->latency.ackMax, ackTime);
         d->latency.queueDepth = frameAcknowledge->queueDepth;
+        if (itr->bytes > 0) {
+            const size_t bucket = itr->bytes < 64 * 1024 ? 0 : itr->bytes < 256 * 1024 ? 1 : 2;
+            d->latency.sizeAcks[bucket]++;
+            d->latency.sizeAckTotal[bucket] += ackTime;
+        }
+        static const bool trace = qEnvironmentVariableIntValue("KRDP_FRAME_TRACE") != 0;
+        if (trace) {
+            qCDebug(KRDP).noquote() << "Frame trace:" << id << "bytes" << itr->bytes << "ack us" << ackTime.count() << "in flight" << itr->inFlight;
+        }
         d->logLatencyStats(now);
     }
 
@@ -1180,7 +1210,7 @@ void VideoStream::sendFrame(const VideoFrame &frame)
     const auto frameId = d->frameId++;
     {
         std::lock_guard lock(d->pendingFramesMutex);
-        d->pendingFrames.insert(frameId, clk::steady_clock::now());
+        d->pendingFrames.insert(frameId, Private::PendingFrame{.sent = clk::steady_clock::now()});
     }
 
     bool submitted = false;
@@ -1239,12 +1269,18 @@ void VideoStream::sendFrame(const VideoFrame &frame)
         std::lock_guard lock(d->pendingFramesMutex);
         const auto now = clk::steady_clock::now();
         if (auto itr = d->pendingFrames.find(frameId); itr != d->pendingFrames.end()) {
-            const auto encodeTime = clk::duration_cast<clk::microseconds>(now - itr.value());
+            const auto encodeTime = clk::duration_cast<clk::microseconds>(now - itr->sent);
             d->latency.frames++;
             d->latency.encodeTotal += encodeTime;
             d->latency.encodeMax = std::max(d->latency.encodeMax, encodeTime);
             // Measure the acknowledgement from when the frame went out, not from the encode start.
-            itr.value() = now;
+            itr->sent = now;
+            if (usesFreeRdpH264(d->activeEncodingMode)) {
+                itr->bytes = d->surface->lastFrameBytes;
+                d->latency.bytesTotal += itr->bytes;
+                d->latency.bytesMax = std::max(d->latency.bytesMax, itr->bytes);
+            }
+            itr->inFlight = d->pendingFrames.size();
         }
     }
 

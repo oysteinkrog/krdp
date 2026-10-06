@@ -387,6 +387,29 @@ int main()
         encoder.encode(cudaPicture.chromaFrame.get(), chromaStream);
     }
     printf("NVENC luma + chroma: %.2f ms per frame\n", timer.nsecsElapsed() / 1e6 / 100);
+    {
+        // No periodic key frames: 300 more frames (600 pictures) must not contain an IDR
+        // slice (NAL type 5). A key frame is a burst of data that delays the frames after it.
+        const auto hasIdr = [](const QByteArray &data) {
+            for (qsizetype i = 0; i + 3 < data.size(); ++i) {
+                if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && (data[i + 3] & 0x1f) == 5) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        int idrPictures = 0;
+        for (int i = 0; i < 300; ++i) {
+            encoder.encode(cudaPicture.lumaFrame.get(), lumaStream);
+            idrPictures += hasIdr(lumaStream);
+            encoder.encode(cudaPicture.chromaFrame.get(), chromaStream);
+            idrPictures += hasIdr(chromaStream);
+        }
+        printf("IDR pictures in 600 after the start: %d\n", idrPictures);
+        if (idrPictures != 0) {
+            ++failures;
+        }
+    }
     for (auto speed : {GpuH264Encoder::Speed::Default, GpuH264Encoder::Speed::Fast, GpuH264Encoder::Speed::Fastest}) {
         GpuH264Encoder presetEncoder;
         presetEncoder.ensure(cudaPicture.lumaFrame.get(), 22, 60, speed);
