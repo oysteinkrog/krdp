@@ -13,6 +13,9 @@
 #include <unistd.h>
 
 #include <QDateTime>
+#include <QScopeGuard>
+
+#include <freerdp/primitives.h>
 
 #include "krdp_logging.h"
 
@@ -66,8 +69,92 @@ VideoStreamSurface::VideoStreamSurface(VideoStream *stream)
 {
 }
 
+namespace
+{
+// Temporary switches while the GPU path is tested: KRDP_GPU_AVC444=1 turns it on, and
+// KRDP_GPU_VERIFY=1 also converts every frame on the CPU and logs any difference.
+bool gpuAvc444Enabled()
+{
+    static const bool enabled = qEnvironmentVariableIntValue("KRDP_GPU_AVC444") == 1;
+    return enabled;
+}
+
+bool gpuVerifyEnabled()
+{
+    static const bool enabled = qEnvironmentVariableIntValue("KRDP_GPU_VERIFY") == 1;
+    return enabled;
+}
+
+// Compares the GPU pictures with FreeRDP's C conversion of the same frame (BGRX).
+void verifyGpuPicture(const GpuAvc444Picture &picture, const QImage &image)
+{
+    static int frames = 0;
+    static qint64 mismatches[2] = {};
+    static int maxDiff[2] = {};
+
+    const int w = picture.size.width();
+    const int h = picture.size.height();
+    if (image.size() != picture.size) {
+        return;
+    }
+    std::vector<uint8_t> luma(picture.luma.size());
+    std::vector<uint8_t> chroma(picture.chroma.size());
+    BYTE *lumaPlanes[3] = {luma.data(), luma.data() + w * h, luma.data() + w * h + w * h / 4};
+    BYTE *chromaPlanes[3] = {chroma.data(), chroma.data() + w * h, chroma.data() + w * h + w * h / 4};
+    const UINT32 strides[3] = {UINT32(w), UINT32(w / 2), UINT32(w / 2)};
+    const prim_size_t roi = {UINT32(w), UINT32(h)};
+    if (primitives_get_generic()->RGBToAVC444YUVv2(image.constBits(), PIXEL_FORMAT_BGRX32, image.bytesPerLine(), lumaPlanes, strides, chromaPlanes, strides, &roi)
+        != PRIMITIVES_SUCCESS) {
+        qCWarning(KRDP) << "GPU AVC444 verify: the CPU conversion failed";
+        return;
+    }
+    const std::vector<uint8_t> *gpu[2] = {&picture.luma, &picture.chroma};
+    const std::vector<uint8_t> *cpu[2] = {&luma, &chroma};
+    for (int p = 0; p < 2; ++p) {
+        for (size_t i = 0; i < cpu[p]->size(); ++i) {
+            const int diff = std::abs(int((*gpu[p])[i]) - int((*cpu[p])[i]));
+            if (diff) {
+                if (mismatches[p] == 0) {
+                    qCWarning(KRDP) << "GPU AVC444 verify: first difference in" << (p ? "chroma" : "luma") << "picture at byte" << i << "GPU"
+                                    << (*gpu[p])[i] << "CPU" << (*cpu[p])[i];
+                }
+                ++mismatches[p];
+                maxDiff[p] = std::max(maxDiff[p], diff);
+            }
+        }
+    }
+    if (++frames % 60 == 0) {
+        qCDebug(KRDP) << "GPU AVC444 verify:" << frames << "frames; luma bytes differing" << mismatches[0] << "max" << maxDiff[0] << "; chroma bytes differing"
+                      << mismatches[1] << "max" << maxDiff[1];
+    }
+}
+}
+
+bool VideoStreamSurface::takeGpuChanges(quint64 sequence, std::vector<uint8_t> &tiles)
+{
+    std::lock_guard lock(gpuChangesMutex);
+    bool complete = !gpuChangesLost;
+    gpuChangesLost = false;
+    tiles.clear();
+    while (!gpuChanges.empty() && gpuChanges.front().first <= sequence) {
+        const auto &changes = gpuChanges.front().second;
+        if (tiles.empty()) {
+            tiles = changes;
+        } else if (tiles.size() == changes.size()) {
+            for (size_t i = 0; i < tiles.size(); ++i) {
+                tiles[i] |= changes[i];
+            }
+        } else {
+            complete = false; // the size changed in between
+        }
+        gpuChanges.pop_front();
+    }
+    return complete && !tiles.empty();
+}
+
 void VideoStreamSurface::setActiveEncodingMode(VideoStream::EncodingMode mode, quint8 quality, int requestedFrameRate)
 {
+    rawMode = mode;
     if (encodedStream) {
         encodedStream->stop();
         encodedStream.reset();
@@ -263,6 +350,34 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
         frameData.presentationTimeStamp = clk::system_clock::time_point(clk::duration_cast<clk::microseconds>(*data.presentationTimestamp));
     }
 
+    if (data.dmabuf && rawMode == VideoStream::EncodingMode::AVC444 && gpuAvc444Enabled() && !gpuFailed) {
+        if (!gpuConverter) {
+            gpuConverter = std::make_unique<GpuAvc444Converter>();
+        }
+        auto picture = std::make_shared<GpuAvc444Picture>();
+        if (gpuConverter->convert(data, *picture)) {
+            frameData.gpuSequence = ++gpuSequence;
+            {
+                std::lock_guard lock(gpuChangesMutex);
+                gpuChanges.emplace_back(frameData.gpuSequence, picture->tiles);
+                // The encoder takes these at least a few times a second; this only grows
+                // while nothing is encoded, and then the next frame is sent in full anyway.
+                if (gpuChanges.size() > 240) {
+                    gpuChanges.pop_front();
+                    gpuChangesLost = true;
+                }
+            }
+            frameData.avc444 = picture;
+            if (!gpuVerifyEnabled()) {
+                queueFrame(frameData);
+                return;
+            }
+        } else if (GpuAvc444Converter::sizeSupported(frameData.size)) {
+            qCWarning(KRDP) << "GPU AVC444 conversion failed; using the CPU from now on";
+            gpuFailed = true;
+        }
+    }
+
     if (data.dataFrame) {
         frameData.image = data.dataFrame->toImage().convertToFormat(QImage::Format_RGB32);
     } else if (data.dmabuf) {
@@ -277,6 +392,9 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
         image.rgbSwap();
         image.reinterpretAsFormat(QImage::Format_RGB32);
         frameData.image = std::move(image);
+        if (frameData.avc444) {
+            verifyGpuPicture(*frameData.avc444, frameData.image);
+        }
     } else {
         // KWin sends buffers without image data when only the cursor moved; the cursor
         // itself is handled by the other frameReceived connection.
@@ -472,6 +590,166 @@ VideoStreamSurface::sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *
     }
 
     freeMetablocks();
+    return AvcResult::Sent;
+}
+
+VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerContext *gfxContext,
+                                                                  H264_CONTEXT *h264,
+                                                                  quint64 encoderGeneration,
+                                                                  quint32 qp,
+                                                                  uint32_t frameId,
+                                                                  const VideoFrame &frame,
+                                                                  quint64 resetGeneration)
+{
+    const GpuAvc444Picture &picture = *frame.avc444;
+    if (surface.id == 0) {
+        qCWarning(KRDP) << "No graphics surface available for AVC frame submission";
+        return AvcResult::Unchanged;
+    }
+    if (encoderGeneration != gpuEncoderGeneration) {
+        // A new encoder starts with a key frame and knows neither picture yet.
+        gpuEncoderGeneration = encoderGeneration;
+        gpuLumaSent = false;
+        gpuChromaSent = false;
+    }
+
+    const int width = picture.size.width();
+    const int height = picture.size.height();
+    const int tileRows = (height + 63) / 64;
+    std::vector<uint8_t> tiles;
+    const bool complete = takeGpuChanges(frame.gpuSequence, tiles) && tiles.size() == size_t(picture.tilesPerRow) * tileRows;
+
+    // Changed tiles as rectangles, joining runs of tiles within a row.
+    const auto changedRects = [&](uint8_t bit, bool everything) {
+        std::vector<RECTANGLE_16> rects;
+        if (everything) {
+            rects.push_back({0, 0, UINT16(width), UINT16(height)});
+            return rects;
+        }
+        for (int ty = 0; ty < tileRows; ++ty) {
+            const uint8_t *row = tiles.data() + size_t(ty) * picture.tilesPerRow;
+            for (int tx = 0; tx < picture.tilesPerRow;) {
+                if (!(row[tx] & bit)) {
+                    ++tx;
+                    continue;
+                }
+                const int start = tx;
+                while (tx < picture.tilesPerRow && (row[tx] & bit)) {
+                    ++tx;
+                }
+                rects.push_back({UINT16(start * 64), UINT16(ty * 64), UINT16(std::min(tx * 64, width)), UINT16(std::min((ty + 1) * 64, height))});
+            }
+        }
+        return rects;
+    };
+    const auto lumaRects = changedRects(GpuAvc444Picture::LumaChanged, !complete || !gpuLumaSent);
+    const auto chromaRects = changedRects(GpuAvc444Picture::ChromaChanged, !complete || !gpuChromaSent);
+    if (lumaRects.empty() && chromaRects.empty()) {
+        return AvcResult::Unchanged;
+    }
+
+    // Both pictures go through the one encoder, as one H.264 stream: the client decodes
+    // them with one decoder. h264_compress() encodes whatever is in its YUV buffer.
+    const auto encode = [&](const std::vector<uint8_t> &planes, QByteArray &out) {
+        BYTE *yuv[3] = {};
+        UINT32 strides[3] = {};
+        if (h264_get_yuv_buffer(h264, UINT32(width), UINT32(width), UINT32(height), yuv, strides) < 0) {
+            return false;
+        }
+        const uint8_t *src = planes.data();
+        for (int y = 0; y < height; ++y) {
+            memcpy(yuv[0] + size_t(y) * strides[0], src + size_t(y) * width, width);
+        }
+        src += size_t(width) * height;
+        for (int p = 1; p < 3; ++p) {
+            for (int y = 0; y < height / 2; ++y) {
+                memcpy(yuv[p] + size_t(y) * strides[p], src + size_t(y) * (width / 2), width / 2);
+            }
+            src += size_t(width / 2) * (height / 2);
+        }
+        BYTE *data = nullptr;
+        UINT32 size = 0;
+        if (h264_compress(h264, &data, &size) < 0 || !data) {
+            return false;
+        }
+        out = QByteArray(reinterpret_cast<const char *>(data), qsizetype(size));
+        return true;
+    };
+    QByteArray lumaData;
+    QByteArray chromaData;
+    if ((!lumaRects.empty() && !encode(picture.luma, lumaData)) || (!chromaRects.empty() && !encode(picture.chroma, chromaData))) {
+        qCWarning(KRDP) << "GPU AVC444: H.264 encoding failed";
+        return AvcResult::Failed;
+    }
+
+    const auto makeStream = [qp](const std::vector<RECTANGLE_16> &rects, QByteArray &data) {
+        RDPGFX_AVC420_BITMAP_STREAM stream = {};
+        stream.data = reinterpret_cast<BYTE *>(data.data());
+        stream.length = UINT32(data.size());
+        stream.meta.numRegionRects = UINT32(rects.size());
+        // free_h264_metablock() releases these with free().
+        stream.meta.regionRects = static_cast<RECTANGLE_16 *>(calloc(rects.size(), sizeof(RECTANGLE_16)));
+        stream.meta.quantQualityVals = static_cast<RDPGFX_H264_QUANT_QUALITY *>(calloc(rects.size(), sizeof(RDPGFX_H264_QUANT_QUALITY)));
+        for (size_t i = 0; i < rects.size() && stream.meta.regionRects && stream.meta.quantQualityVals; ++i) {
+            stream.meta.regionRects[i] = rects[i];
+            // As FreeRDP's allocate_h264_metablock(): bits 6 and 7 of qp are flags.
+            stream.meta.quantQualityVals[i].qp = UINT8(qp & 0x3F);
+            stream.meta.quantQualityVals[i].qualityVal = UINT8(100 - (qp & 0x3F));
+        }
+        return stream;
+    };
+
+    RDPGFX_AVC444_BITMAP_STREAM avc444Stream = {};
+    // [MS-RDPEGFX] 2.2.4.5: LC 0 sends both pictures, 1 only luma, 2 only chroma, and the
+    // only picture always goes in the first bitstream.
+    if (!lumaData.isEmpty() && !chromaData.isEmpty()) {
+        avc444Stream.LC = 0;
+        avc444Stream.bitstream[0] = makeStream(lumaRects, lumaData);
+        avc444Stream.bitstream[1] = makeStream(chromaRects, chromaData);
+    } else if (!lumaData.isEmpty()) {
+        avc444Stream.LC = 1;
+        avc444Stream.bitstream[0] = makeStream(lumaRects, lumaData);
+    } else {
+        avc444Stream.LC = 2;
+        avc444Stream.bitstream[0] = makeStream(chromaRects, chromaData);
+    }
+    avc444Stream.cbAvc420EncodedBitstream1 = 4 + 10 * avc444Stream.bitstream[0].meta.numRegionRects + avc444Stream.bitstream[0].length;
+    const auto freeMetablocks = qScopeGuard([&]() {
+        free_h264_metablock(&avc444Stream.bitstream[0].meta);
+        free_h264_metablock(&avc444Stream.bitstream[1].meta);
+    });
+    if (!avc444Stream.bitstream[0].meta.regionRects || (avc444Stream.LC == 0 && !avc444Stream.bitstream[1].meta.regionRects)) {
+        return AvcResult::Failed;
+    }
+
+    RDPGFX_START_FRAME_PDU startFramePdu = {};
+    RDPGFX_END_FRAME_PDU endFramePdu = {};
+    const auto now = QDateTime::currentDateTimeUtc().time();
+    startFramePdu.timestamp = now.hour() << 22 | now.minute() << 16 | now.second() << 10 | now.msec();
+    startFramePdu.frameId = frameId;
+    endFramePdu.frameId = frameId;
+
+    RDPGFX_SURFACE_COMMAND surfaceCommand = {};
+    surfaceCommand.surfaceId = surface.id;
+    surfaceCommand.contextId = 0;
+    surfaceCommand.format = PIXEL_FORMAT_BGRX32;
+    surfaceCommand.right = UINT32(width);
+    surfaceCommand.bottom = UINT32(height);
+    surfaceCommand.width = UINT32(width);
+    surfaceCommand.height = UINT32(height);
+    surfaceCommand.codecId = RDPGFX_CODECID_AVC444v2;
+    surfaceCommand.extra = &avc444Stream;
+
+    if (this->resetGeneration != resetGeneration) {
+        qCDebug(KRDP) << "Client reset its graphics while frame" << frameId << "was encoded; dropping it";
+        return AvcResult::Stale;
+    }
+    const UINT status = gfxContext->SurfaceFrameCommand(gfxContext, &surfaceCommand, &startFramePdu, &endFramePdu);
+    if (status != CHANNEL_RC_OK) {
+        qCWarning(KRDP) << "SurfaceFrameCommand failed" << status << "frameId" << frameId << "surface" << surfaceCommand.surfaceId << "GPU AVC444";
+    }
+    gpuLumaSent = gpuLumaSent || !lumaData.isEmpty();
+    gpuChromaSent = gpuChromaSent || !chromaData.isEmpty();
     return AvcResult::Sent;
 }
 

@@ -73,6 +73,9 @@ set_package_properties(PAM PROPERTIES DESCRIPTION "PAM Libraries"
 pkg_check_modules(Libei REQUIRED IMPORTED_TARGET libei-1.0>=1.6)
 
 pkg_check_modules(PipeWire REQUIRED IMPORTED_TARGET libpipewire-0.3)
+pkg_check_modules(Epoxy REQUIRED IMPORTED_TARGET epoxy)
+pkg_check_modules(Gbm REQUIRED IMPORTED_TARGET gbm)
+pkg_check_modules(Libdrm REQUIRED IMPORTED_TARGET libdrm)
 
 ecm_find_qmlmodule(org.kde.kirigamiaddons.formcard REQUIRED)
 

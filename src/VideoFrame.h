@@ -18,6 +18,7 @@ namespace KRdp
 {
 
 class RdpConnection;
+struct GpuAvc444Picture;
 
 /**
  * A frame of compressed video data.
@@ -48,5 +49,13 @@ struct VideoFrame {
      * When was this frame presented.
      */
     std::chrono::system_clock::time_point presentationTimeStamp;
+    /**
+     * The frame already converted to AVC444 pictures on the GPU, if that path is on.
+     */
+    std::shared_ptr<const GpuAvc444Picture> avc444;
+    /**
+     * Counts GPU-converted frames; see VideoStreamSurface::takeGpuChanges().
+     */
+    quint64 gpuSequence = 0;
 };
 }

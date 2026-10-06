@@ -26,6 +26,8 @@ target_sources(KRdp PRIVATE
     DisplayControl.h
     EiConnection.cpp
     EiConnection.h
+    GpuAvc444Converter.cpp
+    GpuAvc444Converter.h
     RdpConnection.cpp
     Server.cpp
     Server.h
@@ -89,6 +91,9 @@ target_link_libraries(KRdp PUBLIC
     PkgConfig::Libei
     XKB::XKB
     PkgConfig::PipeWire
+    PkgConfig::Epoxy
+    PkgConfig::Gbm
+    PkgConfig::Libdrm
 )
 
 set_target_properties(KRdp PROPERTIES

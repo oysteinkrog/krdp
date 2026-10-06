@@ -190,6 +190,7 @@ public:
     H264ContextPtr h264 = H264ContextPtr(nullptr, h264_context_free);
     QSize h264Size;
     quint32 h264Qp = 0;
+    quint64 h264Generation = 0; ///< counts encoder (re)opens; each starts with a key frame
     bool nvencFailed = false;
     std::atomic_bool h264Recreate = false;
     std::atomic<quint32> h264TargetQp = h264QpForQuality(100);
@@ -370,6 +371,7 @@ bool VideoStream::Private::ensureH264(const QSize &size)
         h264.reset();
         return false;
     }
+    ++h264Generation;
     if (!h264_context_set_option(h264.get(), H264_CONTEXT_OPTION_RATECONTROL, H264_RATECONTROL_CQP)
         || !h264_context_set_option(h264.get(), H264_CONTEXT_OPTION_QP, qp)
         || !h264_context_set_option(h264.get(), H264_CONTEXT_OPTION_FRAMERATE, quint32(requestedFrameRate.load()))
@@ -1180,7 +1182,9 @@ void VideoStream::sendFrame(const VideoFrame &frame)
     } else if (usesFreeRdpH264(d->activeEncodingMode)) {
         if (d->ensureH264(frame.size)) {
             const bool avc444 = d->activeEncodingMode == EncodingMode::AVC444;
-            const auto result = d->surface->sendFrameAvc(d->gfxContext.get(), d->h264.get(), avc444, frameId, frame, resetGeneration);
+            const auto result = avc444 && frame.avc444
+                ? d->surface->sendFrameAvcGpu(d->gfxContext.get(), d->h264.get(), d->h264Generation, d->h264Qp, frameId, frame, resetGeneration)
+                : d->surface->sendFrameAvc(d->gfxContext.get(), d->h264.get(), avc444, frameId, frame, resetGeneration);
             submitted = result == VideoStreamSurface::AvcResult::Sent;
             if (result == VideoStreamSurface::AvcResult::Failed && encoderSettings().encoder == VideoEncoderSettings::Encoder::Auto && !d->nvencFailed) {
                 qCWarning(KRDP) << "H.264 encoding failed with NVENC; switching to libx264";
