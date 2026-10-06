@@ -17,6 +17,7 @@
 #include <qt6keychain/keychain.h>
 
 #include "Server.h"
+#include "AudioStream.h"
 #include "SessionController.h"
 #include "VideoStream.h"
 #include "krdp_version.h"
@@ -173,6 +174,7 @@ int main(int argc, char **argv)
         controller.setOperationMode(config->exclusiveMode() ? SessionController::OperationMode::RemoteAccess : SessionController::OperationMode::SharedAccess);
     }
 
+    KRdp::AudioStream::setSettings(KRdp::AudioSettings::fromStrings(config->audioCodec(), config->audioIdleTimeout()));
     KRdp::VideoStream::setEncoderSettings(
         KRdp::VideoEncoderSettings::fromStrings(config->videoCodec(), config->videoEncoder(), config->encoderSpeed(), config->remoteFxQuality()));
 

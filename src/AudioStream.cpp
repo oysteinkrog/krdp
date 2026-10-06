@@ -48,8 +48,38 @@ static constexpr int s_aacFrameSamples = 1024;
 static constexpr uint32_t s_aacSampleRate = 44100;
 static constexpr int s_opusBitrate = 96000;
 static constexpr uint32_t s_maxRenderLatencyMs = 300;
-static constexpr auto s_silenceTimeoutDefault = std::chrono::seconds(5);
+// Opus needs a longer minimum: see drainCaptureRingIntoPending().
 static constexpr auto s_silenceTimeoutOpus = std::chrono::seconds(10);
+static constexpr auto s_latencyLogInterval = std::chrono::seconds(5);
+
+static AudioSettings s_settings;
+
+AudioSettings AudioSettings::fromStrings(const QString &codec, int idleTimeoutSeconds)
+{
+    AudioSettings settings;
+    const QString c = codec.trimmed().toLower();
+    if (c == QLatin1String("auto")) {
+        settings.codec = Codec::Auto;
+    } else if (c == QLatin1String("aac")) {
+        settings.codec = Codec::Aac;
+    } else if (c == QLatin1String("opus")) {
+        settings.codec = Codec::Opus;
+    } else {
+        settings.codec = Codec::Pcm;
+    }
+    settings.idleTimeout = std::chrono::seconds(std::max(0, idleTimeoutSeconds));
+    return settings;
+}
+
+void AudioStream::setSettings(const AudioSettings &settings)
+{
+    s_settings = settings;
+}
+
+AudioSettings AudioStream::settings()
+{
+    return s_settings;
+}
 
 class AudioStream::Private
 {
@@ -90,6 +120,7 @@ public:
     uint64_t framesSent = 0;
     std::chrono::steady_clock::time_point lastSound{};
     bool idle = false;
+    std::chrono::steady_clock::time_point lastLatencyLog{};
     UINT16 clientFormatIndex = 0;
     HANDLE wakeEvent = nullptr;
 
@@ -352,14 +383,24 @@ bool AudioStream::initialize()
     if (!formats) {
         return false;
     }
+    // The client takes the first format in this list that it supports.
     uint16_t idx = 0;
+    const auto codec = s_settings.codec;
+    if (codec == AudioSettings::Codec::Pcm) {
+        formats[idx++] = audioFormat(WAVE_FORMAT_PCM, 48000);
+    }
+    if (haveOpus && codec == AudioSettings::Codec::Opus) {
+        formats[idx++] = opus;
+    }
     if (haveAac) {
         formats[idx++] = aac;
     }
-    if (haveOpus) {
+    if (haveOpus && codec != AudioSettings::Codec::Opus) {
         formats[idx++] = opus;
     }
-    formats[idx++] = audioFormat(WAVE_FORMAT_PCM, 48000);
+    if (codec != AudioSettings::Codec::Pcm) {
+        formats[idx++] = audioFormat(WAVE_FORMAT_PCM, 48000);
+    }
     formats[idx++] = audioFormat(WAVE_FORMAT_PCM, 44100);
     d->rdpsnd->server_formats = formats;
     d->rdpsnd->num_server_formats = numFormats;
@@ -384,6 +425,14 @@ void AudioStream::handleMessages()
     }
     if (!d->running.load()) {
         return;
+    }
+    if (KRDP().isDebugEnabled() && !d->idle) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - d->lastLatencyLog >= s_latencyLogInterval) {
+            d->lastLatencyLog = now;
+            qCDebug(KRDP) << "Audio latency: client reports" << d->currentRenderLatencyMs() << "ms, server buffer"
+                          << d->pending.size() * 1000 / (s_blockAlign * d->sampleRate) << "ms";
+        }
     }
     if (d->currentRenderLatencyMs() > s_maxRenderLatencyMs) {
         d->pending.clear();
@@ -537,7 +586,8 @@ void AudioStream::Private::drainCaptureRingIntoPending()
             idle = false;
             qCDebug(KRDP) << "Audio: sound resumed; streaming to the client again";
         }
-    } else if (const auto silenceTimeout = codec == Codec::Opus ? s_silenceTimeoutOpus : s_silenceTimeoutDefault; !idle && now - lastSound >= silenceTimeout) {
+    } else if (const auto silenceTimeout = codec == Codec::Opus ? std::max(s_settings.idleTimeout, s_silenceTimeoutOpus) : s_settings.idleTimeout;
+               s_settings.idleTimeout.count() > 0 && !idle && now - lastSound >= silenceTimeout) {
         idle = true;
         pending.clear();
         rdpsnd->Close(rdpsnd);
