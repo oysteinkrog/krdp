@@ -5,6 +5,13 @@
 // Offline test for GpuAvc444Converter: fills a GBM buffer with known pixels, converts it on
 // the GPU and compares both pictures byte for byte with FreeRDP's C conversion. Then it
 // changes a few pixels and checks that exactly the right tiles are marked as changed.
+//
+// Build it against a configured KRDP build tree (for the generated krdp_logging files):
+//   export PKG_CONFIG_PATH=/opt/krdp-local/lib/pkgconfig
+//   g++ -std=c++20 -O2 -fPIC -o gpuavc444test tools/gpuavc444test.cpp src/GpuAvc444Converter.cpp \
+//       BUILD/src/krdp_logging.cpp -IBUILD/src -I/opt/krdp-local/include/KPipeWire \
+//       $(pkg-config --cflags --libs Qt6Core Qt6Gui epoxy gbm libdrm freerdp3 winpr3 libpipewire-0.3) \
+//       -Wl,-rpath,/opt/krdp-local/lib
 
 #include <cstdio>
 #include <cstring>
