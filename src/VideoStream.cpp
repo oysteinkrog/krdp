@@ -20,7 +20,7 @@
 #include <thread>
 
 #include <QQueue>
-#include <QSet>
+#include <QHash>
 
 #include <freerdp/codec/h264.h>
 #include <freerdp/freerdp.h>
@@ -211,8 +211,21 @@ public:
     std::jthread frameSubmissionThread;
     std::mutex frameQueueMutex;
     QQueue<VideoFrame> frameQueue;
-    QSet<uint32_t> pendingFrames;
+    QHash<uint32_t, clk::steady_clock::time_point> pendingFrames; // frame id -> time it was sent
     std::mutex pendingFramesMutex;
+
+    // Latency statistics for the debug log, guarded by pendingFramesMutex. See logLatencyStats().
+    struct LatencyStats {
+        clk::steady_clock::time_point windowStart = clk::steady_clock::now();
+        int frames = 0;
+        clk::microseconds encodeTotal{0};
+        clk::microseconds encodeMax{0};
+        int acks = 0;
+        clk::microseconds ackTotal{0};
+        clk::microseconds ackMax{0};
+        uint32_t queueDepth = 0;
+    } latency;
+    void logLatencyStats(clk::steady_clock::time_point now);
 
     std::atomic_int requestedFrameRate = 60;
     std::atomic<qsizetype> maxInFlight{MaximumInFlightFrames}; // recomputed from RTT on rttChanged
@@ -794,6 +807,24 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
     return CHANNEL_RC_OK;
 }
 
+void VideoStream::Private::logLatencyStats(clk::steady_clock::time_point now)
+{
+    const auto window = now - latency.windowStart;
+    if (window < clk::seconds(5)) {
+        return;
+    }
+    const auto ms = [](clk::microseconds us) {
+        return QString::number(us.count() / 1000.0, 'f', 1);
+    };
+    const double seconds = clk::duration<double>(window).count();
+    qCDebug(KRDP).noquote() << "Video latency:" << QString::number(latency.frames / seconds, 'f', 1) << "fps, encode avg"
+                            << ms(latency.frames ? latency.encodeTotal / latency.frames : clk::microseconds(0)) << "ms max" << ms(latency.encodeMax)
+                            << "ms, send to ack avg" << ms(latency.acks ? latency.ackTotal / latency.acks : clk::microseconds(0)) << "ms max"
+                            << ms(latency.ackMax) << "ms, in flight" << pendingFrames.size() << "client queue" << latency.queueDepth;
+    latency = LatencyStats{};
+    latency.windowStart = now;
+}
+
 uint32_t VideoStream::onFrameAcknowledge(const RDPGFX_FRAME_ACKNOWLEDGE_PDU *frameAcknowledge)
 {
     auto id = frameAcknowledge->frameId;
@@ -804,6 +835,16 @@ uint32_t VideoStream::onFrameAcknowledge(const RDPGFX_FRAME_ACKNOWLEDGE_PDU *fra
     if (itr == d->pendingFrames.cend()) {
         qCWarning(KRDP) << "Got frame acknowledge for an unknown frame";
         return CHANNEL_RC_OK;
+    }
+
+    if (KRDP().isDebugEnabled()) {
+        const auto now = clk::steady_clock::now();
+        const auto ackTime = clk::duration_cast<clk::microseconds>(now - itr.value());
+        d->latency.acks++;
+        d->latency.ackTotal += ackTime;
+        d->latency.ackMax = std::max(d->latency.ackMax, ackTime);
+        d->latency.queueDepth = frameAcknowledge->queueDepth;
+        d->logLatencyStats(now);
     }
 
     d->pendingFrames.erase(itr);
@@ -1130,7 +1171,7 @@ void VideoStream::sendFrame(const VideoFrame &frame)
     const auto frameId = d->frameId++;
     {
         std::lock_guard lock(d->pendingFramesMutex);
-        d->pendingFrames.insert(frameId);
+        d->pendingFrames.insert(frameId, clk::steady_clock::now());
     }
 
     bool submitted = false;
@@ -1154,6 +1195,17 @@ void VideoStream::sendFrame(const VideoFrame &frame)
     if (!submitted) {
         std::lock_guard lock(d->pendingFramesMutex);
         d->pendingFrames.remove(frameId);
+    } else if (KRDP().isDebugEnabled()) {
+        std::lock_guard lock(d->pendingFramesMutex);
+        const auto now = clk::steady_clock::now();
+        if (auto itr = d->pendingFrames.find(frameId); itr != d->pendingFrames.end()) {
+            const auto encodeTime = clk::duration_cast<clk::microseconds>(now - itr.value());
+            d->latency.frames++;
+            d->latency.encodeTotal += encodeTime;
+            d->latency.encodeMax = std::max(d->latency.encodeMax, encodeTime);
+            // Measure the acknowledgement from when the frame went out, not from the encode start.
+            itr.value() = now;
+        }
     }
 
     QMetaObject::invokeMethod(this, &VideoStream::updateBackpressure, Qt::QueuedConnection);
