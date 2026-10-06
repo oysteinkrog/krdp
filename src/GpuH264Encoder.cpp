@@ -29,6 +29,14 @@ void GpuH264Encoder::close()
     m_size = QSize();
 }
 
+void GpuH264Encoder::requestKeyFrame()
+{
+    if (m_context) {
+        m_keyFrameRequested = true;
+        ++m_generation;
+    }
+}
+
 quint64 GpuH264Encoder::generation() const
 {
     return m_generation;
@@ -74,6 +82,8 @@ bool GpuH264Encoder::ensure(const AVFrame *frame, quint32 qp, int frameRate, Spe
     av_opt_set_int(m_context->priv_data, "zerolatency", 1, 0);
     av_opt_set_int(m_context->priv_data, "delay", 0, 0);
     av_opt_set_int(m_context->priv_data, "qp", qp, 0);
+    // A requested key frame is an IDR picture, which also repeats SPS and PPS.
+    av_opt_set_int(m_context->priv_data, "forced-idr", 1, 0);
 
     if (const int rc = avcodec_open2(m_context, codec, nullptr); rc < 0) {
         char error[AV_ERROR_MAX_STRING_SIZE] = {};
@@ -87,6 +97,7 @@ bool GpuH264Encoder::ensure(const AVFrame *frame, quint32 qp, int frameRate, Spe
     m_frameRate = frameRate;
     m_speed = speed;
     m_pts = 0;
+    m_keyFrameRequested = false;
     ++m_generation;
     qCDebug(KRDP) << "GPU encode: h264_nvenc" << size << "QP" << qp << "preset" << preset;
     return true;
@@ -98,10 +109,15 @@ bool GpuH264Encoder::encode(AVFrame *frame, QByteArray &out)
         return false;
     }
     frame->pts = m_pts++;
-    if (avcodec_send_frame(m_context, frame) < 0) {
+    const bool keyFrame = m_keyFrameRequested;
+    frame->pict_type = keyFrame ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+    const int sent = avcodec_send_frame(m_context, frame);
+    frame->pict_type = AV_PICTURE_TYPE_NONE;
+    if (sent < 0) {
         qCWarning(KRDP) << "GPU encode: avcodec_send_frame failed";
         return false;
     }
+    m_keyFrameRequested = false;
     out.clear();
     // With zero latency and no B-frames, NVENC returns the packet for this frame right away.
     while (true) {
@@ -114,7 +130,7 @@ bool GpuH264Encoder::encode(AVFrame *frame, QByteArray &out)
             return false;
         }
         if ((m_packet->flags & AV_PKT_FLAG_KEY) && m_pts > 1) {
-            qCDebug(KRDP) << "GPU encode: key frame at picture" << m_pts - 1 << "bytes" << m_packet->size;
+            qCDebug(KRDP) << "GPU encode:" << (keyFrame ? "requested" : "unexpected") << "key frame at picture" << m_pts - 1 << "bytes" << m_packet->size;
         }
         out.append(reinterpret_cast<const char *>(m_packet->data), m_packet->size);
         av_packet_unref(m_packet);

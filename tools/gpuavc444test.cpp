@@ -390,13 +390,16 @@ int main()
     {
         // No periodic key frames: 300 more frames (600 pictures) must not contain an IDR
         // slice (NAL type 5). A key frame is a burst of data that delays the frames after it.
-        const auto hasIdr = [](const QByteArray &data) {
+        const auto hasNal = [](const QByteArray &data, int type) {
             for (qsizetype i = 0; i + 3 < data.size(); ++i) {
-                if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && (data[i + 3] & 0x1f) == 5) {
+                if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && (data[i + 3] & 0x1f) == type) {
                     return true;
                 }
             }
             return false;
+        };
+        const auto hasIdr = [&](const QByteArray &data) {
+            return hasNal(data, 5);
         };
         int idrPictures = 0;
         for (int i = 0; i < 300; ++i) {
@@ -407,6 +410,22 @@ int main()
         }
         printf("IDR pictures in 600 after the start: %d\n", idrPictures);
         if (idrPictures != 0) {
+            ++failures;
+        }
+        // A requested key frame: the next picture is IDR with SPS (NAL type 7), the one after
+        // it is not, and the generation moves on.
+        const quint64 generation = encoder.generation();
+        encoder.requestKeyFrame();
+        encoder.encode(cudaPicture.lumaFrame.get(), lumaStream);
+        encoder.encode(cudaPicture.chromaFrame.get(), chromaStream);
+        const bool keyOk = hasIdr(lumaStream) && hasNal(lumaStream, 7) && !hasIdr(chromaStream) && encoder.generation() == generation + 1;
+        printf("requested key frame: luma IDR %d SPS %d, chroma IDR %d: %s\n", hasIdr(lumaStream), hasNal(lumaStream, 7), hasIdr(chromaStream), keyOk ? "ok" : "WRONG");
+        // A new decoder, as mstsc has after a reset, starts from the requested key frame.
+        double keyPsnr = 0;
+        int keyMax = 0;
+        const bool keyDecoded = decode(true, keyPsnr, keyMax);
+        printf("fresh decoder from the requested key frame: %s, PSNR %.1f dB\n", keyDecoded ? "decoded" : "FAILED", keyPsnr);
+        if (!keyOk || !keyDecoded || keyPsnr < psnr444 - 1) {
             ++failures;
         }
     }

@@ -194,7 +194,11 @@ public:
     quint64 h264Generation = 0; ///< counts encoder (re)opens; each starts with a key frame
     // NVENC fed straight from the GPU converter's CUDA frames; see GpuH264Encoder.
     GpuH264Encoder gpuEncoder;
-    std::atomic_bool gpuEncoderRecreate = false;
+    // The client needs a key frame on the GPU path: a forced IDR picture, not a new encoder.
+    std::atomic_bool gpuKeyFrameNeeded = false;
+    GpuH264Encoder::Speed gpuSpeed() const;
+    /// Opens NVENC for a frame that is waiting, before frames may be sent; see sendFrame().
+    void prepareGpuEncoder();
     bool nvencFailed = false;
     std::atomic_bool h264Recreate = false;
     std::atomic<quint32> h264TargetQp = h264QpForQuality(100);
@@ -345,6 +349,39 @@ bool VideoStream::avc444Allowed()
     return !h264Disabled() && (s_encoderSettings.codec == VideoEncoderSettings::Codec::Auto || s_encoderSettings.codec == VideoEncoderSettings::Codec::AVC444);
 }
 
+GpuH264Encoder::Speed VideoStream::Private::gpuSpeed() const
+{
+    switch (encoderSettings().speed) {
+    case VideoEncoderSettings::Speed::Fastest:
+        return GpuH264Encoder::Speed::Fastest;
+    case VideoEncoderSettings::Speed::Default:
+        return GpuH264Encoder::Speed::Default;
+    case VideoEncoderSettings::Speed::Fast:
+        break;
+    }
+    return GpuH264Encoder::Speed::Fast;
+}
+
+void VideoStream::Private::prepareGpuEncoder()
+{
+    // Opening NVENC takes about 100 ms. The first frame of a connection waits 500 ms anyway
+    // (see onCapsAdvertise()), so open it in that time.
+    if (activeEncodingMode != EncodingMode::AVC444) {
+        return;
+    }
+    std::shared_ptr<AVFrame> lumaFrame;
+    {
+        std::lock_guard lock(frameQueueMutex);
+        if (frameQueue.isEmpty() || !frameQueue.first().avc444) {
+            return;
+        }
+        lumaFrame = frameQueue.first().avc444->lumaFrame;
+    }
+    if (lumaFrame) {
+        gpuEncoder.ensure(lumaFrame.get(), h264TargetQp.load(), requestedFrameRate.load(), gpuSpeed());
+    }
+}
+
 bool VideoStream::Private::ensureH264(const QSize &size)
 {
     if (h264Recreate.exchange(false)) {
@@ -421,7 +458,7 @@ void VideoStream::setActiveEncodingMode(EncodingMode mode)
     if (usesFreeRdpH264(mode)) {
         // A new stream needs a new encoder, so the client gets a key frame first.
         d->h264Recreate = true;
-        d->gpuEncoderRecreate = true;
+        d->gpuKeyFrameNeeded = true;
     }
 }
 
@@ -494,6 +531,7 @@ bool VideoStream::initialize()
     d->frameSubmissionThread = std::jthread([this](std::stop_token token) {
         while (!token.stop_requested()) {
             if (!hasInFlightCapacity() || !d->gfxContext || !d->capsConfirmed || clk::steady_clock::now() < d->firstFrameNotBefore.load()) {
+                d->prepareGpuEncoder();
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
@@ -1010,7 +1048,7 @@ void VideoStream::performReset(QSize newSize)
         // changed since its previous frame, so a reused encoder would leave every
         // unchanged block black. A fresh encoder lists the whole frame first.
         d->h264Recreate = true;
-        d->gpuEncoderRecreate = true;
+        d->gpuKeyFrameNeeded = true;
     }
 
     surface = Surface{
@@ -1221,15 +1259,11 @@ void VideoStream::sendFrame(const VideoFrame &frame)
             const bool avc444 = d->activeEncodingMode == EncodingMode::AVC444;
             VideoStreamSurface::AvcResult result = VideoStreamSurface::AvcResult::Failed;
             if (avc444 && frame.avc444 && frame.avc444->lumaFrame) {
-                const auto &settings = encoderSettings();
-                const auto speed = settings.speed == VideoEncoderSettings::Speed::Fastest ? GpuH264Encoder::Speed::Fastest
-                    : settings.speed == VideoEncoderSettings::Speed::Default                ? GpuH264Encoder::Speed::Default
-                                                                                            : GpuH264Encoder::Speed::Fast;
-                if (d->gpuEncoderRecreate.exchange(false)) {
-                    d->gpuEncoder.close();
-                }
                 const quint32 qp = d->h264TargetQp.load();
-                if (d->gpuEncoder.ensure(frame.avc444->lumaFrame.get(), qp, d->requestedFrameRate.load(), speed)) {
+                if (d->gpuEncoder.ensure(frame.avc444->lumaFrame.get(), qp, d->requestedFrameRate.load(), d->gpuSpeed())) {
+                    if (d->gpuKeyFrameNeeded.exchange(false)) {
+                        d->gpuEncoder.requestKeyFrame();
+                    }
                     const auto &picture = *frame.avc444;
                     result = d->surface->sendFrameAvcGpu(
                         d->gfxContext.get(),

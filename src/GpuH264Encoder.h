@@ -38,7 +38,11 @@ public:
     /// from one CUDA frames context, which the encoder takes from the first frame.
     bool ensure(const AVFrame *frame, quint32 qp, int frameRate, Speed speed);
 
-    /// Counts the encoders opened; each one starts with a key frame.
+    /// Makes the next picture an IDR picture with SPS and PPS, for a client that dropped its
+    /// decoder. Much faster than opening a new encoder (about 100 ms). Counts as a new generation.
+    void requestKeyFrame();
+
+    /// Counts the encoders opened and the key frames requested; each starts the stream anew.
     quint64 generation() const;
 
     bool encode(AVFrame *frame, QByteArray &out);
@@ -54,6 +58,7 @@ private:
     Speed m_speed = Speed::Fast;
     quint64 m_generation = 0;
     qint64 m_pts = 0;
+    bool m_keyFrameRequested = false;
 };
 
 }
