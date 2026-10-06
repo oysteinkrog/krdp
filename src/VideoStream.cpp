@@ -776,7 +776,10 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         // 100 ms after our first CapsConfirm. Anything we send in between (ResetGraphics,
         // CreateSurface, a frame) makes it drop the connection with a protocol error. The
         // KPipeWire encoder never had a frame ready that soon; FreeRDP with NVENC does.
-        d->firstFrameNotBefore = clk::steady_clock::now() + FirstFrameDelay;
+        static const clk::milliseconds delay = qEnvironmentVariableIsSet("KRDP_FIRST_FRAME_DELAY_MS")
+            ? clk::milliseconds(qEnvironmentVariableIntValue("KRDP_FIRST_FRAME_DELAY_MS"))
+            : FirstFrameDelay;
+        d->firstFrameNotBefore = clk::steady_clock::now() + delay;
     }
     d->capsConfirmed = true;
 
