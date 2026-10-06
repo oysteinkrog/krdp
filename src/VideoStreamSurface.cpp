@@ -131,7 +131,9 @@ void VideoStreamSurface::setActiveEncodingMode(VideoStream::EncodingMode mode, q
             [this](const auto &frame) {
                 onFrameReceived(frame);
             },
-            Qt::QueuedConnection);
+            // Direct: KPipeWire hands the buffer back to KWin as soon as frameReceived
+            // returns, so a queued call would read a buffer KWin may be drawing into again.
+            Qt::DirectConnection);
         QObject::connect(sourceStream.get(), &PipeWireSourceStream::streamParametersChanged, this, [this]() {
             m_stream->setSize(sourceStream->size());
         });
@@ -264,11 +266,16 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
     if (data.dataFrame) {
         frameData.image = data.dataFrame->toImage().convertToFormat(QImage::Format_RGB32);
     } else if (data.dmabuf) {
-        QImage image(frameData.size, QImage::Format_RGBA8888_Premultiplied);
+        // The encoders want BGRX (Format_RGB32), but DmaBufHandler can only read back RGBA.
+        // Swapping R and B in place and relabelling is a fast SIMD pass; converting from
+        // RGBA8888_Premultiplied with convertToFormat() took Qt's slow generic path.
+        QImage image(frameData.size, QImage::Format_RGBX8888);
         if (!dmaBufHandler.downloadFrame(image, data)) {
             qCWarning(KRDP) << "Failed to download DMA-BUF frame";
             return;
         }
+        image.rgbSwap();
+        image.reinterpretAsFormat(QImage::Format_RGB32);
         frameData.image = std::move(image);
     } else {
         // KWin sends buffers without image data when only the cursor moved; the cursor
