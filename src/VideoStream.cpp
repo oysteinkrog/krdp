@@ -114,6 +114,7 @@ struct RdpCapsInformation {
     bool avcSupported : 1 = false;
     bool yuv420Supported : 1 = false;
     bool avc444Supported : 1 = false;
+    bool known : 1 = false; ///< a version FreeRDP and KRDP understand
 };
 
 const char *capVersionToString(uint32_t version)
@@ -763,12 +764,14 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         case RDPGFX_CAPVERSION_106:
         case RDPGFX_CAPVERSION_105:
         case RDPGFX_CAPVERSION_104:
+            caps.known = true;
             caps.yuv420Supported = true;
             Q_FALLTHROUGH();
         case RDPGFX_CAPVERSION_103:
         case RDPGFX_CAPVERSION_102:
         case RDPGFX_CAPVERSION_101:
         case RDPGFX_CAPVERSION_10:
+            caps.known = true;
             if (!(set.flags & RDPGFX_CAPS_FLAG_AVC_DISABLED)) {
                 caps.avcSupported = true;
                 // A thin client asks for AVC420 only.
@@ -776,16 +779,18 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
             }
             break;
         case RDPGFX_CAPVERSION_81:
+            caps.known = true;
             if (set.flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED) {
                 caps.avcSupported = true;
                 caps.yuv420Supported = true;
             }
             break;
         case RDPGFX_CAPVERSION_8:
+            caps.known = true;
             break;
         }
 
-        qCDebug(KRDP) << " " << capVersionToString(caps.version) << "flags:" << Qt::hex << set.flags << Qt::dec << "AVC:" << caps.avcSupported
+        qCDebug(KRDP) << " " << capVersionToString(caps.version) << Qt::hex << caps.version << "flags:" << Qt::hex << set.flags << Qt::dec << "AVC:" << caps.avcSupported
                       << "YUV420:" << caps.yuv420Supported << "AVC444:" << caps.avc444Supported;
 
         capsInformation.push_back(caps);
@@ -797,8 +802,10 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         return caps.avcSupported && caps.yuv420Supported;
     });
 
+    // Confirm the newest version we know. msrdc (the Windows App) also advertises versions
+    // newer than FreeRDP knows; confirming one of those turned AVC444 off.
     auto maxVersion = std::max_element(capsInformation.begin(), capsInformation.end(), [](const auto &first, const auto &second) {
-        return first.version < second.version;
+        return first.known != second.known ? !first.known : first.version < second.version;
     });
     // AVC444 is only possible with the caps set we confirm, which is the highest one.
     const bool supportsAvc444 = maxVersion != capsInformation.end() && maxVersion->avcSupported && maxVersion->avc444Supported;
