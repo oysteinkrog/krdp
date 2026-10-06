@@ -11,6 +11,8 @@
 #include <QSize>
 
 struct PipeWireFrame;
+struct AVFrame;
+struct AVBufferRef;
 
 namespace KRdp
 {
@@ -28,6 +30,9 @@ struct GpuAvc444Picture {
     /// there since the previous conversion, bit 1 if the chroma picture did.
     std::vector<uint8_t> tiles;
     int tilesPerRow = 0;
+    /// With Output::Cuda: the two pictures as FFmpeg CUDA frames (YUV420P), ready for NVENC.
+    std::shared_ptr<AVFrame> lumaFrame;
+    std::shared_ptr<AVFrame> chromaFrame;
 
     static constexpr uint8_t LumaChanged = 1;
     static constexpr uint8_t ChromaChanged = 2;
@@ -50,11 +55,18 @@ public:
     /// (the decoder aligns the chroma halves to that) and the height even.
     static bool sizeSupported(const QSize &size);
 
+    enum class Output {
+        Cpu, ///< read both pictures back into GpuAvc444Picture::luma and chroma
+        Cuda, ///< copy them into CUDA frames on the GPU, see GpuAvc444Picture::lumaFrame
+        TilesOnly, ///< only the changed tiles, for timing tests
+    };
+
     /// Converts the frame. Returns false if the GPU path is not available or failed, in
     /// which case the caller should use the CPU path.
-    /// With readPictures false, only the changed tiles are read back and the pictures stay
-    /// on the GPU.
-    bool convert(const PipeWireFrame &frame, GpuAvc444Picture &picture, bool readPictures = true);
+    bool convert(const PipeWireFrame &frame, GpuAvc444Picture &picture, Output output = Output::Cpu);
+
+    /// Whether Output::Cuda works: libcuda is there and can share buffers with the GL context.
+    bool cudaAvailable();
 
     /// Forgets the previous picture, so the next conversion marks every tile as changed.
     void reset();

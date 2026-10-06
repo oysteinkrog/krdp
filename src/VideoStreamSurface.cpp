@@ -85,6 +85,14 @@ bool gpuVerifyEnabled()
     return enabled;
 }
 
+// KRDP_GPU_NO_CUDA=1 reads the pictures back and encodes them with FreeRDP instead of
+// handing CUDA frames to NVENC. The verification needs the pictures on the CPU too.
+bool gpuCudaOutputWanted()
+{
+    static const bool wanted = qEnvironmentVariableIntValue("KRDP_GPU_NO_CUDA") != 1 && !gpuVerifyEnabled();
+    return wanted;
+}
+
 // Compares the GPU pictures with FreeRDP's C conversion of the same frame (BGRX).
 void verifyGpuPicture(const GpuAvc444Picture &picture, const QImage &image)
 {
@@ -355,7 +363,8 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
             gpuConverter = std::make_unique<GpuAvc444Converter>();
         }
         auto picture = std::make_shared<GpuAvc444Picture>();
-        if (gpuConverter->convert(data, *picture)) {
+        const auto output = gpuCudaOutputWanted() && gpuConverter->cudaAvailable() ? GpuAvc444Converter::Output::Cuda : GpuAvc444Converter::Output::Cpu;
+        if (gpuConverter->convert(data, *picture, output)) {
             frameData.gpuSequence = ++gpuSequence;
             {
                 std::lock_guard lock(gpuChangesMutex);
@@ -594,7 +603,7 @@ VideoStreamSurface::sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *
 }
 
 VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerContext *gfxContext,
-                                                                  H264_CONTEXT *h264,
+                                                                  const AvcEncode &encode,
                                                                   quint64 encoderGeneration,
                                                                   quint32 qp,
                                                                   uint32_t frameId,
@@ -649,35 +658,10 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
     }
 
     // Both pictures go through the one encoder, as one H.264 stream: the client decodes
-    // them with one decoder. h264_compress() encodes whatever is in its YUV buffer.
-    const auto encode = [&](const std::vector<uint8_t> &planes, QByteArray &out) {
-        BYTE *yuv[3] = {};
-        UINT32 strides[3] = {};
-        if (h264_get_yuv_buffer(h264, UINT32(width), UINT32(width), UINT32(height), yuv, strides) < 0) {
-            return false;
-        }
-        const uint8_t *src = planes.data();
-        for (int y = 0; y < height; ++y) {
-            memcpy(yuv[0] + size_t(y) * strides[0], src + size_t(y) * width, width);
-        }
-        src += size_t(width) * height;
-        for (int p = 1; p < 3; ++p) {
-            for (int y = 0; y < height / 2; ++y) {
-                memcpy(yuv[p] + size_t(y) * strides[p], src + size_t(y) * (width / 2), width / 2);
-            }
-            src += size_t(width / 2) * (height / 2);
-        }
-        BYTE *data = nullptr;
-        UINT32 size = 0;
-        if (h264_compress(h264, &data, &size) < 0 || !data) {
-            return false;
-        }
-        out = QByteArray(reinterpret_cast<const char *>(data), qsizetype(size));
-        return true;
-    };
+    // them with one decoder.
     QByteArray lumaData;
     QByteArray chromaData;
-    if ((!lumaRects.empty() && !encode(picture.luma, lumaData)) || (!chromaRects.empty() && !encode(picture.chroma, chromaData))) {
+    if ((!lumaRects.empty() && !encode(false, lumaData)) || (!chromaRects.empty() && !encode(true, chromaData))) {
         qCWarning(KRDP) << "GPU AVC444: H.264 encoding failed";
         return AvcResult::Failed;
     }

@@ -14,10 +14,17 @@
 
 #include <QDir>
 #include <QList>
+#include <QScopeGuard>
 
 #include <PipeWireSourceStream>
 
+#include "GpuCuda.h"
 #include "krdp_logging.h"
+
+extern "C" {
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_cuda.h>
+}
 
 namespace KRdp
 {
@@ -148,6 +155,10 @@ public:
     ~Private();
     bool initialize();
     bool ensureBuffers(const QSize &size);
+    bool initializeCuda();
+    bool ensureCudaFrames(const QSize &size);
+    void unregisterCudaBuffers();
+    bool copyToCuda(int index, const QSize &size, GpuAvc444Picture &picture);
     GLuint importTexture(const DmaBufAttributes &dmabuf, EGLImage *image);
 
     bool initialized = false;
@@ -167,12 +178,26 @@ public:
     GLuint tileBuffer = 0;
     int current = 0; ///< index of the buffers the next conversion writes
     bool havePrevious = false;
+
+    // CUDA output, see initializeCuda().
+    const GpuCuda *cuda = nullptr;
+    bool cudaTried = false;
+    CUdevice cudaDevice = 0;
+    CUcontext cudaContext = nullptr;
+    AVBufferRef *hwDevice = nullptr;
+    AVBufferRef *hwFrames = nullptr;
+    QSize hwFramesSize;
+    CUgraphicsResource cudaLuma[2] = {};
+    CUgraphicsResource cudaChroma[2] = {};
 };
 
 GpuAvc444Converter::Private::~Private()
 {
+    av_buffer_unref(&hwFrames);
+    av_buffer_unref(&hwDevice);
     if (context != EGL_NO_CONTEXT) {
         eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context);
+        unregisterCudaBuffers();
         glDeleteBuffers(2, lumaBuffers);
         glDeleteBuffers(2, chromaBuffers);
         glDeleteBuffers(1, &tileBuffer);
@@ -183,12 +208,164 @@ GpuAvc444Converter::Private::~Private()
     if (display != EGL_NO_DISPLAY) {
         eglTerminate(display);
     }
+    if (cudaContext) {
+        cuda->devicePrimaryCtxRelease(cudaDevice);
+    }
     if (gbm) {
         gbm_device_destroy(gbm);
     }
     if (drmFd >= 0) {
         close(drmFd);
     }
+}
+
+bool GpuAvc444Converter::Private::initializeCuda()
+{
+    if (cudaTried) {
+        return cudaContext != nullptr;
+    }
+    cudaTried = true;
+    cuda = GpuCuda::get();
+    if (!cuda) {
+        return false;
+    }
+    // The CUDA device that runs our GL context, with the primary context FFmpeg and NVENC use.
+    unsigned int count = 0;
+    if (const CUresult r = cuda->glGetDevices(&count, &cudaDevice, 1, CU_GL_DEVICE_LIST_ALL); r != CUDA_SUCCESS || count == 0) {
+        qCWarning(KRDP) << "GPU encode: the GL context is not on a CUDA device" << cuda->errorName(r);
+        return false;
+    }
+    if (const CUresult r = cuda->devicePrimaryCtxRetain(&cudaContext, cudaDevice); r != CUDA_SUCCESS) {
+        qCWarning(KRDP) << "GPU encode: no CUDA context" << cuda->errorName(r);
+        cudaContext = nullptr;
+        return false;
+    }
+    hwDevice = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_CUDA);
+    if (!hwDevice) {
+        return false;
+    }
+    auto *deviceContext = reinterpret_cast<AVHWDeviceContext *>(hwDevice->data);
+    static_cast<AVCUDADeviceContext *>(deviceContext->hwctx)->cuda_ctx = cudaContext;
+    if (av_hwdevice_ctx_init(hwDevice) < 0) {
+        qCWarning(KRDP) << "GPU encode: FFmpeg cannot use the CUDA context";
+        av_buffer_unref(&hwDevice);
+        return false;
+    }
+    qCDebug(KRDP) << "GPU encode: CUDA device" << cudaDevice << "ready";
+    return true;
+}
+
+bool GpuAvc444Converter::Private::ensureCudaFrames(const QSize &size)
+{
+    if (hwFrames && hwFramesSize == size) {
+        return true;
+    }
+    av_buffer_unref(&hwFrames);
+    hwFrames = av_hwframe_ctx_alloc(hwDevice);
+    if (!hwFrames) {
+        return false;
+    }
+    auto *framesContext = reinterpret_cast<AVHWFramesContext *>(hwFrames->data);
+    framesContext->format = AV_PIX_FMT_CUDA;
+    framesContext->sw_format = AV_PIX_FMT_YUV420P;
+    framesContext->width = size.width();
+    framesContext->height = size.height();
+    if (av_hwframe_ctx_init(hwFrames) < 0) {
+        qCWarning(KRDP) << "GPU encode: cannot make CUDA frames of" << size;
+        av_buffer_unref(&hwFrames);
+        return false;
+    }
+    hwFramesSize = size;
+    return true;
+}
+
+void GpuAvc444Converter::Private::unregisterCudaBuffers()
+{
+    if (!cudaContext) {
+        return;
+    }
+    cuda->ctxPushCurrent(cudaContext);
+    for (auto *resources : {cudaLuma, cudaChroma}) {
+        for (int i = 0; i < 2; ++i) {
+            if (resources[i]) {
+                cuda->graphicsUnregisterResource(resources[i]);
+                resources[i] = nullptr;
+            }
+        }
+    }
+    CUcontext popped = nullptr;
+    cuda->ctxPopCurrent(&popped);
+}
+
+bool GpuAvc444Converter::Private::copyToCuda(int index, const QSize &size, GpuAvc444Picture &picture)
+{
+    if (!ensureCudaFrames(size)) {
+        return false;
+    }
+    cuda->ctxPushCurrent(cudaContext);
+    auto popContext = qScopeGuard([this]() {
+        CUcontext popped = nullptr;
+        cuda->ctxPopCurrent(&popped);
+    });
+    if (!cudaLuma[index]) {
+        for (int i = 0; i < 2; ++i) {
+            if (cuda->graphicsGLRegisterBuffer(&cudaLuma[i], lumaBuffers[i], CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY) != CUDA_SUCCESS
+                || cuda->graphicsGLRegisterBuffer(&cudaChroma[i], chromaBuffers[i], CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY) != CUDA_SUCCESS) {
+                qCWarning(KRDP) << "GPU encode: cannot share the GL buffers with CUDA";
+                return false;
+            }
+        }
+    }
+
+    CUgraphicsResource resources[2] = {cudaLuma[index], cudaChroma[index]};
+    // Mapping waits for the GL work that wrote the buffers.
+    if (const CUresult r = cuda->graphicsMapResources(2, resources, nullptr); r != CUDA_SUCCESS) {
+        qCWarning(KRDP) << "GPU encode: cannot map the buffers" << cuda->errorName(r);
+        return false;
+    }
+    auto unmap = qScopeGuard([&]() {
+        cuda->graphicsUnmapResources(2, resources, nullptr);
+    });
+
+    const int w = size.width();
+    const int h = size.height();
+    std::shared_ptr<AVFrame> *targets[2] = {&picture.lumaFrame, &picture.chromaFrame};
+    for (int p = 0; p < 2; ++p) {
+        CUdeviceptr source = 0;
+        size_t sourceSize = 0;
+        if (cuda->graphicsResourceGetMappedPointer(&source, &sourceSize, resources[p]) != CUDA_SUCCESS) {
+            return false;
+        }
+        AVFrame *frame = av_frame_alloc();
+        if (!frame || av_hwframe_get_buffer(hwFrames, frame, 0) < 0) {
+            av_frame_free(&frame);
+            qCWarning(KRDP) << "GPU encode: no free CUDA frame";
+            return false;
+        }
+        *targets[p] = std::shared_ptr<AVFrame>(frame, [](AVFrame *f) {
+            av_frame_free(&f);
+        });
+        const size_t planeOffset[3] = {0, size_t(w) * h, size_t(w) * h + size_t(w / 2) * (h / 2)};
+        const size_t planeWidth[3] = {size_t(w), size_t(w / 2), size_t(w / 2)};
+        const size_t planeHeight[3] = {size_t(h), size_t(h / 2), size_t(h / 2)};
+        for (int plane = 0; plane < 3; ++plane) {
+            CUDA_MEMCPY2D copy = {};
+            copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            copy.srcDevice = source + planeOffset[plane];
+            copy.srcPitch = planeWidth[plane];
+            copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+            copy.dstDevice = reinterpret_cast<CUdeviceptr>(frame->data[plane]);
+            copy.dstPitch = size_t(frame->linesize[plane]);
+            copy.WidthInBytes = planeWidth[plane];
+            copy.Height = planeHeight[plane];
+            if (cuda->memcpy2DAsync(&copy, nullptr) != CUDA_SUCCESS) {
+                qCWarning(KRDP) << "GPU encode: CUDA copy failed";
+                return false;
+            }
+        }
+    }
+    // The encoder runs on another thread with its own stream, so finish the copies here.
+    return cuda->streamSynchronize(nullptr) == CUDA_SUCCESS;
 }
 
 bool GpuAvc444Converter::Private::initialize()
@@ -285,6 +462,7 @@ bool GpuAvc444Converter::Private::ensureBuffers(const QSize &size)
     if (size == bufferSize) {
         return true;
     }
+    unregisterCudaBuffers();
     glDeleteBuffers(2, lumaBuffers);
     glDeleteBuffers(2, chromaBuffers);
     glDeleteBuffers(1, &tileBuffer);
@@ -353,12 +531,20 @@ bool GpuAvc444Converter::sizeSupported(const QSize &size)
     return size.width() > 0 && size.height() > 0 && size.width() % 32 == 0 && size.height() % 2 == 0;
 }
 
+bool GpuAvc444Converter::cudaAvailable()
+{
+    if (!d->initialize() || !eglMakeCurrent(d->display, EGL_NO_SURFACE, EGL_NO_SURFACE, d->context)) {
+        return false;
+    }
+    return d->initializeCuda();
+}
+
 void GpuAvc444Converter::reset()
 {
     d->havePrevious = false;
 }
 
-bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &picture, bool readPictures)
+bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &picture, Output output)
 {
     if (!frame.dmabuf || frame.dmabuf->planes.isEmpty()) {
         return false;
@@ -408,7 +594,10 @@ bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &p
     const qsizetype pictureSize = qsizetype(size.width()) * size.height() * 3 / 2;
     std::vector<GLuint> tileWords(size_t(tilesPerRow) * tileRows);
     glGetNamedBufferSubData(d->tileBuffer, 0, GLsizeiptr(tileWords.size() * sizeof(GLuint)), tileWords.data());
-    if (readPictures) {
+    bool copied = true;
+    if (output == Output::Cuda) {
+        copied = d->copyToCuda(cur, size, picture);
+    } else if (output == Output::Cpu) {
         picture.luma.resize(pictureSize);
         picture.chroma.resize(pictureSize);
         glGetNamedBufferSubData(d->lumaBuffers[cur], 0, pictureSize, picture.luma.data());
@@ -419,8 +608,10 @@ bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &p
     glDeleteTextures(1, &texture);
     eglDestroyImageKHR(d->display, image);
 
-    if (const GLenum error = glGetError(); error != GL_NO_ERROR) {
-        qCWarning(KRDP) << "GPU AVC444: GL error" << Qt::hex << error;
+    if (const GLenum error = glGetError(); error != GL_NO_ERROR || !copied) {
+        if (error != GL_NO_ERROR) {
+            qCWarning(KRDP) << "GPU AVC444: GL error" << Qt::hex << error;
+        }
         d->havePrevious = false;
         return false;
     }

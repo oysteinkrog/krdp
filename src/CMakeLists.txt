@@ -28,6 +28,10 @@ target_sources(KRdp PRIVATE
     EiConnection.h
     GpuAvc444Converter.cpp
     GpuAvc444Converter.h
+    GpuCuda.cpp
+    GpuCuda.h
+    GpuH264Encoder.cpp
+    GpuH264Encoder.h
     RdpConnection.cpp
     Server.cpp
     Server.h
@@ -94,7 +98,13 @@ target_link_libraries(KRdp PUBLIC
     PkgConfig::Epoxy
     PkgConfig::Gbm
     PkgConfig::Libdrm
+    PkgConfig::LibAVCodec
+    PkgConfig::LibAVUtil
+    ${CMAKE_DL_LIBS}
 )
+# CUDA driver API headers for the GPU encode path; libcuda itself is loaded at run time.
+find_path(CUDA_DRIVER_INCLUDE_DIR cuda.h cudaGL.h PATHS /opt/cuda/include ENV CUDA_PATH PATH_SUFFIXES include REQUIRED)
+target_include_directories(KRdp PRIVATE ${CUDA_DRIVER_INCLUDE_DIR})
 
 set_target_properties(KRdp PROPERTIES
     VERSION ${PROJECT_VERSION}

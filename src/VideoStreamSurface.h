@@ -8,6 +8,7 @@
 #include <atomic>
 #include <memory>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -54,10 +55,12 @@ public:
         Stale, ///< the client reset its GFX state while the frame was encoded, nothing sent
     };
     AvcResult sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *h264, bool avc444, uint32_t frameId, const VideoFrame &frame, quint64 resetGeneration);
-    /// AVC444 from a frame the GPU already converted. encoderGeneration changes whenever the
-    /// H.264 encoder was opened again, which means both pictures must be sent in full.
+    /// AVC444 from a frame the GPU already converted. encode(chroma, out) encodes the luma
+    /// or chroma picture of the frame. encoderGeneration changes whenever the H.264 encoder
+    /// was opened again, which means both pictures must be sent in full.
+    using AvcEncode = std::function<bool(bool chroma, QByteArray &out)>;
     AvcResult sendFrameAvcGpu(RdpgfxServerContext *gfxContext,
-                              H264_CONTEXT *h264,
+                              const AvcEncode &encode,
                               quint64 encoderGeneration,
                               quint32 qp,
                               uint32_t frameId,
@@ -78,7 +81,7 @@ public:
 
     // GPU conversion for AVC444, on the main thread in onFrameReceived().
     std::unique_ptr<GpuAvc444Converter> gpuConverter;
-    bool gpuFailed = false;
+    std::atomic_bool gpuFailed = false; // set by the frame submission thread if encoding fails
     // Changed tiles of every converted frame, by sequence number. Each frame's tiles say what
     // changed since the frame before it, so a frame that is dropped before encoding must pass
     // its tiles on: the encoder takes the union of all frames since the last one it encoded.

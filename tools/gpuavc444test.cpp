@@ -30,7 +30,13 @@
 
 #include <PipeWireSourceStream>
 
+#include <cmath>
+
+#include <freerdp/channels/rdpgfx.h>
+#include <freerdp/codec/h264.h>
+
 #include "../src/GpuAvc444Converter.h"
+#include "../src/GpuH264Encoder.h"
 
 using namespace KRdp;
 
@@ -242,9 +248,156 @@ int main()
     printf("convert + read back: %.2f ms per frame\n", timer.nsecsElapsed() / 1e6 / 100);
     timer.restart();
     for (int i = 0; i < 100; ++i) {
-        converter.convert(frameFor(buffer), picture, false);
+        converter.convert(frameFor(buffer), picture, GpuAvc444Converter::Output::TilesOnly);
     }
     printf("convert + tiles only: %.2f ms per frame\n", timer.nsecsElapsed() / 1e6 / 100);
+
+    // End to end on a desktop-like picture: a gradient with one-pixel coloured lines, which
+    // is where 4:4:4 matters. Convert into CUDA frames, encode with NVENC, decode with
+    // FreeRDP's AVC444 decoder, and compare with the source.
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            uint32_t r = (x * 255) / W;
+            uint32_t g = (y * 255) / H;
+            uint32_t b = 128;
+            if (x % 7 == 0) {
+                r = 255, g = 0, b = 0;
+            }
+            if (y % 5 == 0) {
+                r = 0, g = 0, b = 255;
+            }
+            pixels[size_t(y) * W + x] = 0xff000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+    GpuAvc444Converter cudaConverter;
+    if (!cudaConverter.cudaAvailable()) {
+        printf("CUDA output not available\n");
+        return 1;
+    }
+    GpuAvc444Picture cudaPicture;
+    if (!fill(buffer, pixels, gbm) || !cudaConverter.convert(frameFor(buffer), cudaPicture, GpuAvc444Converter::Output::Cuda) || !cudaPicture.lumaFrame
+        || !cudaPicture.chromaFrame) {
+        printf("CUDA conversion failed\n");
+        return 1;
+    }
+    GpuH264Encoder encoder;
+    QByteArray lumaStream;
+    QByteArray chromaStream;
+    if (!encoder.ensure(cudaPicture.lumaFrame.get(), 12, 60, GpuH264Encoder::Speed::Fast) || !encoder.encode(cudaPicture.lumaFrame.get(), lumaStream)
+        || !encoder.encode(cudaPicture.chromaFrame.get(), chromaStream)) {
+        printf("NVENC encoding failed\n");
+        return 1;
+    }
+    printf("NVENC: luma %lld bytes, chroma %lld bytes\n", (long long)lumaStream.size(), (long long)chromaStream.size());
+
+    const auto decode = [&](bool withChroma, double &psnr, int &maxDiff) {
+        H264_CONTEXT *decoder = h264_context_new(FALSE);
+        h264_context_reset(decoder, W, H);
+        std::vector<uint8_t> out(size_t(W) * H * 4);
+        const RECTANGLE_16 full = {0, 0, W, H};
+        const INT32 rc = avc444_decompress(decoder,
+                                           withChroma ? 0 : 1,
+                                           &full,
+                                           1,
+                                           reinterpret_cast<const BYTE *>(lumaStream.constData()),
+                                           UINT32(lumaStream.size()),
+                                           withChroma ? &full : nullptr,
+                                           withChroma ? 1 : 0,
+                                           withChroma ? reinterpret_cast<const BYTE *>(chromaStream.constData()) : nullptr,
+                                           withChroma ? UINT32(chromaStream.size()) : 0,
+                                           out.data(),
+                                           PIXEL_FORMAT_BGRX32,
+                                           W * 4,
+                                           W,
+                                           H,
+                                           RDPGFX_CODECID_AVC444v2);
+        h264_context_free(decoder);
+        if (rc < 0) {
+            return false;
+        }
+        double sum = 0;
+        maxDiff = 0;
+        for (size_t i = 0; i < size_t(W) * H; ++i) {
+            for (int c = 0; c < 3; ++c) {
+                const int a = (pixels[i] >> (8 * c)) & 0xff;
+                const int b = out[i * 4 + c];
+                sum += double(a - b) * (a - b);
+                maxDiff = std::max(maxDiff, std::abs(a - b));
+            }
+        }
+        psnr = 10 * std::log10(255.0 * 255.0 / (sum / (double(W) * H * 3)));
+        return true;
+    };
+    double psnr444 = 0;
+    double psnr420 = 0;
+    int max444 = 0;
+    int max420 = 0;
+    if (!decode(true, psnr444, max444) || !decode(false, psnr420, max420)) {
+        printf("FreeRDP could not decode the stream\n");
+        return 1;
+    }
+    printf("decoded 4:4:4: PSNR %.1f dB, max error %d; luma picture only (4:2:0): PSNR %.1f dB, max error %d\n", psnr444, max444, psnr420, max420);
+    failures += (psnr444 > psnr420 + 3) ? 0 : 1;
+
+    // The same picture through FreeRDP's own path (CPU conversion, FreeRDP's NVENC setup),
+    // as the reference for what the stream should look like.
+    {
+        H264_CONTEXT *cpuEncoder = h264_context_new(TRUE);
+        h264_context_set_option(cpuEncoder, H264_CONTEXT_OPTION_ENCODER, H264_ENCODER_NVENC);
+        h264_context_set_option(cpuEncoder, H264_CONTEXT_OPTION_ENCODER_SPEED, H264_ENCODER_SPEED_FAST);
+        h264_context_reset(cpuEncoder, W, H);
+        h264_context_set_option(cpuEncoder, H264_CONTEXT_OPTION_RATECONTROL, H264_RATECONTROL_CQP);
+        h264_context_set_option(cpuEncoder, H264_CONTEXT_OPTION_QP, 12);
+        h264_context_set_option(cpuEncoder, H264_CONTEXT_OPTION_FRAMERATE, 60);
+        const RECTANGLE_16 full = {0, 0, W, H};
+        BYTE op = 0;
+        BYTE *a = nullptr;
+        BYTE *b = nullptr;
+        UINT32 aSize = 0;
+        UINT32 bSize = 0;
+        RDPGFX_H264_METABLOCK m1 = {};
+        RDPGFX_H264_METABLOCK m2 = {};
+        const INT32 rc = avc444_compress(cpuEncoder, reinterpret_cast<const BYTE *>(pixels.data()), PIXEL_FORMAT_BGRX32, W * 4, W, H, 2, &full, &op, &a, &aSize, &b, &bSize, &m1, &m2);
+        if (rc > 0) {
+            lumaStream = QByteArray(reinterpret_cast<const char *>(a), aSize);
+            chromaStream = QByteArray(reinterpret_cast<const char *>(b), bSize);
+            double p444 = 0;
+            double p420 = 0;
+            int m444 = 0;
+            int m420 = 0;
+            decode(true, p444, m444);
+            decode(false, p420, m420);
+            printf("FreeRDP path: luma %u bytes, chroma %u bytes; decoded 4:4:4 PSNR %.1f dB max %d; 4:2:0 PSNR %.1f dB max %d\n", aSize, bSize, p444, m444, p420, m420);
+        } else {
+            printf("FreeRDP avc444_compress failed (%d)\n", rc);
+        }
+        free_h264_metablock(&m1);
+        free_h264_metablock(&m2);
+        h264_context_free(cpuEncoder);
+    }
+
+    timer.restart();
+    for (int i = 0; i < 100; ++i) {
+        cudaConverter.convert(frameFor(buffer), cudaPicture, GpuAvc444Converter::Output::Cuda);
+    }
+    printf("convert into CUDA frames: %.2f ms per frame\n", timer.nsecsElapsed() / 1e6 / 100);
+    timer.restart();
+    for (int i = 0; i < 100; ++i) {
+        encoder.encode(cudaPicture.lumaFrame.get(), lumaStream);
+        encoder.encode(cudaPicture.chromaFrame.get(), chromaStream);
+    }
+    printf("NVENC luma + chroma: %.2f ms per frame\n", timer.nsecsElapsed() / 1e6 / 100);
+    for (auto speed : {GpuH264Encoder::Speed::Default, GpuH264Encoder::Speed::Fast, GpuH264Encoder::Speed::Fastest}) {
+        GpuH264Encoder presetEncoder;
+        presetEncoder.ensure(cudaPicture.lumaFrame.get(), 22, 60, speed);
+        // Alternate the detailed frame with a slightly changed copy, as a desktop would.
+        timer.restart();
+        for (int i = 0; i < 60; ++i) {
+            presetEncoder.encode(cudaPicture.lumaFrame.get(), lumaStream);
+            presetEncoder.encode(cudaPicture.chromaFrame.get(), chromaStream);
+        }
+        printf("preset %d (QP 22): %.2f ms per frame, last luma %lld bytes\n", int(speed), timer.nsecsElapsed() / 1e6 / 60, (long long)lumaStream.size());
+    }
 
     printf(failures ? "FAILED\n" : "PASSED\n");
     return failures ? 1 : 0;

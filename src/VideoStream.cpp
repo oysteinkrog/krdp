@@ -28,6 +28,7 @@
 #include <freerdp/update.h>
 #include <qassert.h>
 
+#include "GpuH264Encoder.h"
 #include "NetworkDetection.h"
 #include "PeerContext_p.h"
 #include "RdpConnection.h"
@@ -191,6 +192,10 @@ public:
     QSize h264Size;
     quint32 h264Qp = 0;
     quint64 h264Generation = 0; ///< counts encoder (re)opens; each starts with a key frame
+    // NVENC fed straight from the GPU converter's CUDA frames; see GpuH264Encoder.
+    GpuH264Encoder gpuEncoder;
+    std::atomic_bool gpuEncoderRecreate = false;
+    bool encodeFreeRdpPicture(const GpuAvc444Picture &picture, bool chroma, QByteArray &out);
     bool nvencFailed = false;
     std::atomic_bool h264Recreate = false;
     std::atomic<quint32> h264TargetQp = h264QpForQuality(100);
@@ -383,6 +388,36 @@ bool VideoStream::Private::ensureH264(const QSize &size)
     return true;
 }
 
+bool VideoStream::Private::encodeFreeRdpPicture(const GpuAvc444Picture &picture, bool chroma, QByteArray &out)
+{
+    // h264_compress() encodes whatever is in the context's YUV buffer.
+    const int width = picture.size.width();
+    const int height = picture.size.height();
+    BYTE *yuv[3] = {};
+    UINT32 strides[3] = {};
+    if (h264_get_yuv_buffer(h264.get(), UINT32(width), UINT32(width), UINT32(height), yuv, strides) < 0) {
+        return false;
+    }
+    const uint8_t *src = (chroma ? picture.chroma : picture.luma).data();
+    for (int y = 0; y < height; ++y) {
+        memcpy(yuv[0] + size_t(y) * strides[0], src + size_t(y) * width, width);
+    }
+    src += size_t(width) * height;
+    for (int p = 1; p < 3; ++p) {
+        for (int y = 0; y < height / 2; ++y) {
+            memcpy(yuv[p] + size_t(y) * strides[p], src + size_t(y) * (width / 2), width / 2);
+        }
+        src += size_t(width / 2) * (height / 2);
+    }
+    BYTE *data = nullptr;
+    UINT32 size = 0;
+    if (h264_compress(h264.get(), &data, &size) < 0 || !data) {
+        return false;
+    }
+    out = QByteArray(reinterpret_cast<const char *>(data), qsizetype(size));
+    return true;
+}
+
 VideoStream::VideoStream(RdpConnection *session)
     : QObject(nullptr)
     , d(std::make_unique<Private>())
@@ -406,6 +441,7 @@ void VideoStream::setActiveEncodingMode(EncodingMode mode)
     if (usesFreeRdpH264(mode)) {
         // A new stream needs a new encoder, so the client gets a key frame first.
         d->h264Recreate = true;
+        d->gpuEncoderRecreate = true;
     }
 }
 
@@ -974,6 +1010,7 @@ void VideoStream::performReset(QSize newSize)
         // changed since its previous frame, so a reused encoder would leave every
         // unchanged block black. A fresh encoder lists the whole frame first.
         d->h264Recreate = true;
+        d->gpuEncoderRecreate = true;
     }
 
     surface = Surface{
@@ -1182,9 +1219,50 @@ void VideoStream::sendFrame(const VideoFrame &frame)
     } else if (usesFreeRdpH264(d->activeEncodingMode)) {
         if (d->ensureH264(frame.size)) {
             const bool avc444 = d->activeEncodingMode == EncodingMode::AVC444;
-            const auto result = avc444 && frame.avc444
-                ? d->surface->sendFrameAvcGpu(d->gfxContext.get(), d->h264.get(), d->h264Generation, d->h264Qp, frameId, frame, resetGeneration)
-                : d->surface->sendFrameAvc(d->gfxContext.get(), d->h264.get(), avc444, frameId, frame, resetGeneration);
+            VideoStreamSurface::AvcResult result = VideoStreamSurface::AvcResult::Failed;
+            if (avc444 && frame.avc444 && frame.avc444->lumaFrame) {
+                const auto &settings = encoderSettings();
+                const auto speed = settings.speed == VideoEncoderSettings::Speed::Fastest ? GpuH264Encoder::Speed::Fastest
+                    : settings.speed == VideoEncoderSettings::Speed::Default                ? GpuH264Encoder::Speed::Default
+                                                                                            : GpuH264Encoder::Speed::Fast;
+                if (d->gpuEncoderRecreate.exchange(false)) {
+                    d->gpuEncoder.close();
+                }
+                const quint32 qp = d->h264TargetQp.load();
+                if (d->gpuEncoder.ensure(frame.avc444->lumaFrame.get(), qp, d->requestedFrameRate.load(), speed)) {
+                    const auto &picture = *frame.avc444;
+                    result = d->surface->sendFrameAvcGpu(
+                        d->gfxContext.get(),
+                        [this, &picture](bool chroma, QByteArray &out) {
+                            return d->gpuEncoder.encode(chroma ? picture.chromaFrame.get() : picture.lumaFrame.get(), out);
+                        },
+                        d->gpuEncoder.generation(),
+                        qp,
+                        frameId,
+                        frame,
+                        resetGeneration);
+                }
+                if (result == VideoStreamSurface::AvcResult::Failed) {
+                    // Go back to the CPU path for the next frames; this frame is lost.
+                    qCWarning(KRDP) << "GPU encode failed; using the CPU path from now on";
+                    d->surface->gpuFailed = true;
+                    result = VideoStreamSurface::AvcResult::Unchanged;
+                }
+            } else if (avc444 && frame.avc444) {
+                const auto &picture = *frame.avc444;
+                result = d->surface->sendFrameAvcGpu(
+                    d->gfxContext.get(),
+                    [this, &picture](bool chroma, QByteArray &out) {
+                        return d->encodeFreeRdpPicture(picture, chroma, out);
+                    },
+                    d->h264Generation,
+                    d->h264Qp,
+                    frameId,
+                    frame,
+                    resetGeneration);
+            } else {
+                result = d->surface->sendFrameAvc(d->gfxContext.get(), d->h264.get(), avc444, frameId, frame, resetGeneration);
+            }
             submitted = result == VideoStreamSurface::AvcResult::Sent;
             if (result == VideoStreamSurface::AvcResult::Failed && encoderSettings().encoder == VideoEncoderSettings::Encoder::Auto && !d->nvencFailed) {
                 qCWarning(KRDP) << "H.264 encoding failed with NVENC; switching to libx264";

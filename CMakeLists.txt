@@ -76,6 +76,8 @@ pkg_check_modules(PipeWire REQUIRED IMPORTED_TARGET libpipewire-0.3)
 pkg_check_modules(Epoxy REQUIRED IMPORTED_TARGET epoxy)
 pkg_check_modules(Gbm REQUIRED IMPORTED_TARGET gbm)
 pkg_check_modules(Libdrm REQUIRED IMPORTED_TARGET libdrm)
+pkg_check_modules(LibAVCodec REQUIRED IMPORTED_TARGET libavcodec)
+pkg_check_modules(LibAVUtil REQUIRED IMPORTED_TARGET libavutil)
 
 ecm_find_qmlmodule(org.kde.kirigamiaddons.formcard REQUIRED)
 
