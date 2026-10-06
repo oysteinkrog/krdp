@@ -899,6 +899,7 @@ void VideoStream::performReset(QSize newSize)
     monitor.bottom = newSize.height();
     monitor.flags = MONITOR_PRIMARY;
     resetGraphicsPdu.monitorDefArray = &monitor;
+    qCDebug(KRDP) << "ResetGraphics" << newSize << "next surface" << d->nextSurfaceId << "frameId" << d->frameId;
     UINT status = d->gfxContext->ResetGraphics(d->gfxContext.get(), &resetGraphicsPdu);
     if (status != CHANNEL_RC_OK) {
         qCWarning(KRDP) << "ResetGraphics failed" << status << "for size" << newSize;

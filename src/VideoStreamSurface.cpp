@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <optional>
+#include <algorithm>
 #include <utility>
 
 #include <unistd.h>
@@ -422,6 +423,29 @@ VideoStreamSurface::sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *
     if (rc == 0) {
         freeMetablocks();
         return AvcResult::Unchanged;
+    }
+
+    if (KRDP().isDebugEnabled() && frameId < 3) {
+        const auto describe = [](const RDPGFX_AVC420_BITMAP_STREAM &bs) {
+            QString rects;
+            for (UINT32 i = 0; i < std::min<UINT32>(bs.meta.numRegionRects, 3); ++i) {
+                const auto &r = bs.meta.regionRects[i];
+                const auto &q = bs.meta.quantQualityVals[i];
+                rects += QStringLiteral("[%1,%2,%3,%4 qp%5 r%6 p%7 q%8]").arg(r.left).arg(r.top).arg(r.right).arg(r.bottom).arg(q.qp).arg(q.r).arg(q.p).arg(q.qualityVal);
+            }
+            const QByteArray data = QByteArray::fromRawData(reinterpret_cast<const char *>(bs.data), bs.length);
+            return QStringLiteral("len %1 rects %2 %3 head %4 crc %5")
+                .arg(bs.length)
+                .arg(bs.meta.numRegionRects)
+                .arg(rects, QString::fromLatin1(data.left(48).toHex()))
+                .arg(qChecksum(data));
+        };
+        if (avc444) {
+            qCDebug(KRDP) << "AVC frame" << frameId << "surface" << surface.id << "AVC444v2 LC" << avc444Stream.LC << "cb1" << avc444Stream.cbAvc420EncodedBitstream1
+                          << "bs1:" << describe(avc444Stream.bitstream[0]) << "bs2:" << describe(avc444Stream.bitstream[1]);
+        } else {
+            qCDebug(KRDP) << "AVC frame" << frameId << "surface" << surface.id << "AVC420" << describe(avc420);
+        }
     }
 
     const UINT status = gfxContext->SurfaceFrameCommand(gfxContext, &surfaceCommand, &startFramePdu, &endFramePdu);
