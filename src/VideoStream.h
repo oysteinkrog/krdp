@@ -52,9 +52,12 @@ struct KRDP_EXPORT VideoEncoderSettings {
     Speed speed = Speed::Fast;
     /// RemoteFX quality, 0 to 100. 100 keeps every detail, 50 is the MS default.
     int remoteFxQuality = 100;
+    /// AVC444: convert and encode on the GPU (GL compute shader and NVENC from CUDA memory)
+    /// when CUDA is available, instead of FreeRDP's CPU conversion. Ignored with libx264.
+    bool gpuEncode = true;
 
-    /// Build settings from the strings in krdpserverrc. Unknown values keep the default.
-    static VideoEncoderSettings fromStrings(const QString &codec, const QString &encoder, const QString &speed, int remoteFxQuality);
+    /// Build settings from the values in krdpserverrc. Unknown values keep the default.
+    static VideoEncoderSettings fromStrings(const QString &codec, const QString &encoder, const QString &speed, int remoteFxQuality, bool gpuEncode);
 };
 
 /**

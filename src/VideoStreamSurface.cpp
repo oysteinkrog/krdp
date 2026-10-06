@@ -15,8 +15,6 @@
 #include <QDateTime>
 #include <QScopeGuard>
 
-#include <freerdp/primitives.h>
-
 #include "krdp_logging.h"
 
 namespace KRdp
@@ -71,70 +69,10 @@ VideoStreamSurface::VideoStreamSurface(VideoStream *stream)
 
 namespace
 {
-// Temporary switches while the GPU path is tested: KRDP_GPU_AVC444=1 turns it on, and
-// KRDP_GPU_VERIFY=1 also converts every frame on the CPU and logs any difference.
 bool gpuAvc444Enabled()
 {
-    static const bool enabled = qEnvironmentVariableIntValue("KRDP_GPU_AVC444") == 1;
-    return enabled;
-}
-
-bool gpuVerifyEnabled()
-{
-    static const bool enabled = qEnvironmentVariableIntValue("KRDP_GPU_VERIFY") == 1;
-    return enabled;
-}
-
-// KRDP_GPU_NO_CUDA=1 reads the pictures back and encodes them with FreeRDP instead of
-// handing CUDA frames to NVENC. The verification needs the pictures on the CPU too.
-bool gpuCudaOutputWanted()
-{
-    static const bool wanted = qEnvironmentVariableIntValue("KRDP_GPU_NO_CUDA") != 1 && !gpuVerifyEnabled();
-    return wanted;
-}
-
-// Compares the GPU pictures with FreeRDP's C conversion of the same frame (BGRX).
-void verifyGpuPicture(const GpuAvc444Picture &picture, const QImage &image)
-{
-    static int frames = 0;
-    static qint64 mismatches[2] = {};
-    static int maxDiff[2] = {};
-
-    const int w = picture.size.width();
-    const int h = picture.size.height();
-    if (image.size() != picture.size) {
-        return;
-    }
-    std::vector<uint8_t> luma(picture.luma.size());
-    std::vector<uint8_t> chroma(picture.chroma.size());
-    BYTE *lumaPlanes[3] = {luma.data(), luma.data() + w * h, luma.data() + w * h + w * h / 4};
-    BYTE *chromaPlanes[3] = {chroma.data(), chroma.data() + w * h, chroma.data() + w * h + w * h / 4};
-    const UINT32 strides[3] = {UINT32(w), UINT32(w / 2), UINT32(w / 2)};
-    const prim_size_t roi = {UINT32(w), UINT32(h)};
-    if (primitives_get_generic()->RGBToAVC444YUVv2(image.constBits(), PIXEL_FORMAT_BGRX32, image.bytesPerLine(), lumaPlanes, strides, chromaPlanes, strides, &roi)
-        != PRIMITIVES_SUCCESS) {
-        qCWarning(KRDP) << "GPU AVC444 verify: the CPU conversion failed";
-        return;
-    }
-    const std::vector<uint8_t> *gpu[2] = {&picture.luma, &picture.chroma};
-    const std::vector<uint8_t> *cpu[2] = {&luma, &chroma};
-    for (int p = 0; p < 2; ++p) {
-        for (size_t i = 0; i < cpu[p]->size(); ++i) {
-            const int diff = std::abs(int((*gpu[p])[i]) - int((*cpu[p])[i]));
-            if (diff) {
-                if (mismatches[p] == 0) {
-                    qCWarning(KRDP) << "GPU AVC444 verify: first difference in" << (p ? "chroma" : "luma") << "picture at byte" << i << "GPU"
-                                    << (*gpu[p])[i] << "CPU" << (*cpu[p])[i];
-                }
-                ++mismatches[p];
-                maxDiff[p] = std::max(maxDiff[p], diff);
-            }
-        }
-    }
-    if (++frames % 60 == 0) {
-        qCDebug(KRDP) << "GPU AVC444 verify:" << frames << "frames; luma bytes differing" << mismatches[0] << "max" << maxDiff[0] << "; chroma bytes differing"
-                      << mismatches[1] << "max" << maxDiff[1];
-    }
+    const auto &settings = VideoStream::encoderSettings();
+    return settings.gpuEncode && settings.encoder != VideoEncoderSettings::Encoder::Libx264;
 }
 }
 
@@ -363,8 +301,10 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
             gpuConverter = std::make_unique<GpuAvc444Converter>();
         }
         auto picture = std::make_shared<GpuAvc444Picture>();
-        const auto output = gpuCudaOutputWanted() && gpuConverter->cudaAvailable() ? GpuAvc444Converter::Output::Cuda : GpuAvc444Converter::Output::Cpu;
-        if (gpuConverter->convert(data, *picture, output)) {
+        if (!gpuConverter->cudaAvailable()) {
+            qCWarning(KRDP) << "GPU encode: CUDA is not available; using the CPU path";
+            gpuFailed = true;
+        } else if (gpuConverter->convert(data, *picture, GpuAvc444Converter::Output::Cuda)) {
             frameData.gpuSequence = ++gpuSequence;
             {
                 std::lock_guard lock(gpuChangesMutex);
@@ -377,10 +317,8 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
                 }
             }
             frameData.avc444 = picture;
-            if (!gpuVerifyEnabled()) {
-                queueFrame(frameData);
-                return;
-            }
+            queueFrame(frameData);
+            return;
         } else if (GpuAvc444Converter::sizeSupported(frameData.size)) {
             qCWarning(KRDP) << "GPU AVC444 conversion failed; using the CPU from now on";
             gpuFailed = true;
@@ -401,9 +339,6 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
         image.rgbSwap();
         image.reinterpretAsFormat(QImage::Format_RGB32);
         frameData.image = std::move(image);
-        if (frameData.avc444) {
-            verifyGpuPicture(*frameData.avc444, frameData.image);
-        }
     } else {
         // KWin sends buffers without image data when only the cursor moved; the cursor
         // itself is handled by the other frameReceived connection.

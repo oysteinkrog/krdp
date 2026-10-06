@@ -195,7 +195,6 @@ public:
     // NVENC fed straight from the GPU converter's CUDA frames; see GpuH264Encoder.
     GpuH264Encoder gpuEncoder;
     std::atomic_bool gpuEncoderRecreate = false;
-    bool encodeFreeRdpPicture(const GpuAvc444Picture &picture, bool chroma, QByteArray &out);
     bool nvencFailed = false;
     std::atomic_bool h264Recreate = false;
     std::atomic<quint32> h264TargetQp = h264QpForQuality(100);
@@ -275,7 +274,7 @@ static bool usesFreeRdpH264(std::optional<VideoStream::EncodingMode> mode)
 
 static VideoEncoderSettings s_encoderSettings;
 
-VideoEncoderSettings VideoEncoderSettings::fromStrings(const QString &codec, const QString &encoder, const QString &speed, int remoteFxQuality)
+VideoEncoderSettings VideoEncoderSettings::fromStrings(const QString &codec, const QString &encoder, const QString &speed, int remoteFxQuality, bool gpuEncode)
 {
     VideoEncoderSettings settings;
     const auto is = [](const QString &value, QLatin1StringView name) {
@@ -311,6 +310,7 @@ VideoEncoderSettings VideoEncoderSettings::fromStrings(const QString &codec, con
     }
 
     settings.remoteFxQuality = std::clamp(remoteFxQuality, 0, 100);
+    settings.gpuEncode = gpuEncode;
     return settings;
 }
 
@@ -385,36 +385,6 @@ bool VideoStream::Private::ensureH264(const QSize &size)
     }
     h264Size = size;
     h264Qp = qp;
-    return true;
-}
-
-bool VideoStream::Private::encodeFreeRdpPicture(const GpuAvc444Picture &picture, bool chroma, QByteArray &out)
-{
-    // h264_compress() encodes whatever is in the context's YUV buffer.
-    const int width = picture.size.width();
-    const int height = picture.size.height();
-    BYTE *yuv[3] = {};
-    UINT32 strides[3] = {};
-    if (h264_get_yuv_buffer(h264.get(), UINT32(width), UINT32(width), UINT32(height), yuv, strides) < 0) {
-        return false;
-    }
-    const uint8_t *src = (chroma ? picture.chroma : picture.luma).data();
-    for (int y = 0; y < height; ++y) {
-        memcpy(yuv[0] + size_t(y) * strides[0], src + size_t(y) * width, width);
-    }
-    src += size_t(width) * height;
-    for (int p = 1; p < 3; ++p) {
-        for (int y = 0; y < height / 2; ++y) {
-            memcpy(yuv[p] + size_t(y) * strides[p], src + size_t(y) * (width / 2), width / 2);
-        }
-        src += size_t(width / 2) * (height / 2);
-    }
-    BYTE *data = nullptr;
-    UINT32 size = 0;
-    if (h264_compress(h264.get(), &data, &size) < 0 || !data) {
-        return false;
-    }
-    out = QByteArray(reinterpret_cast<const char *>(data), qsizetype(size));
     return true;
 }
 
@@ -1248,18 +1218,6 @@ void VideoStream::sendFrame(const VideoFrame &frame)
                     d->surface->gpuFailed = true;
                     result = VideoStreamSurface::AvcResult::Unchanged;
                 }
-            } else if (avc444 && frame.avc444) {
-                const auto &picture = *frame.avc444;
-                result = d->surface->sendFrameAvcGpu(
-                    d->gfxContext.get(),
-                    [this, &picture](bool chroma, QByteArray &out) {
-                        return d->encodeFreeRdpPicture(picture, chroma, out);
-                    },
-                    d->h264Generation,
-                    d->h264Qp,
-                    frameId,
-                    frame,
-                    resetGeneration);
             } else {
                 result = d->surface->sendFrameAvc(d->gfxContext.get(), d->h264.get(), avc444, frameId, frame, resetGeneration);
             }
