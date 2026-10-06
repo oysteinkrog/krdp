@@ -52,7 +52,9 @@ public:
 
     /// Converts the frame. Returns false if the GPU path is not available or failed, in
     /// which case the caller should use the CPU path.
-    bool convert(const PipeWireFrame &frame, GpuAvc444Picture &picture);
+    /// With readPictures false, only the changed tiles are read back and the pictures stay
+    /// on the GPU.
+    bool convert(const PipeWireFrame &frame, GpuAvc444Picture &picture, bool readPictures = true);
 
     /// Forgets the previous picture, so the next conversion marks every tile as changed.
     void reset();

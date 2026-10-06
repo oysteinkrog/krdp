@@ -358,7 +358,7 @@ void GpuAvc444Converter::reset()
     d->havePrevious = false;
 }
 
-bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &picture)
+bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &picture, bool readPictures)
 {
     if (!frame.dmabuf || frame.dmabuf->planes.isEmpty()) {
         return false;
@@ -408,10 +408,12 @@ bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &p
     const qsizetype pictureSize = qsizetype(size.width()) * size.height() * 3 / 2;
     std::vector<GLuint> tileWords(size_t(tilesPerRow) * tileRows);
     glGetNamedBufferSubData(d->tileBuffer, 0, GLsizeiptr(tileWords.size() * sizeof(GLuint)), tileWords.data());
-    picture.luma.resize(pictureSize);
-    picture.chroma.resize(pictureSize);
-    glGetNamedBufferSubData(d->lumaBuffers[cur], 0, pictureSize, picture.luma.data());
-    glGetNamedBufferSubData(d->chromaBuffers[cur], 0, pictureSize, picture.chroma.data());
+    if (readPictures) {
+        picture.luma.resize(pictureSize);
+        picture.chroma.resize(pictureSize);
+        glGetNamedBufferSubData(d->lumaBuffers[cur], 0, pictureSize, picture.luma.data());
+        glGetNamedBufferSubData(d->chromaBuffers[cur], 0, pictureSize, picture.chroma.data());
+    }
 
     glBindTexture(GL_TEXTURE_2D, 0);
     glDeleteTextures(1, &texture);
