@@ -42,11 +42,9 @@ namespace KRdp
 {
 
 static constexpr size_t s_maxBufferedBytes = 72000 * s_blockAlign;
-static constexpr int s_aacBitrate = 96000;
 static constexpr int s_aacFrameSamples = 1024;
 // mstsc decodes AAC at 44100 Hz whatever rate is negotiated, so that's the only AAC rate offered
 static constexpr uint32_t s_aacSampleRate = 44100;
-static constexpr int s_opusBitrate = 96000;
 static constexpr uint32_t s_maxRenderLatencyMs = 300;
 // Opus needs a longer minimum: see drainCaptureRingIntoPending().
 static constexpr auto s_silenceTimeoutOpus = std::chrono::seconds(10);
@@ -54,19 +52,20 @@ static constexpr auto s_latencyLogInterval = std::chrono::seconds(5);
 
 static AudioSettings s_settings;
 
-AudioSettings AudioSettings::fromStrings(const QString &codec, int idleTimeoutSeconds)
+AudioSettings AudioSettings::fromStrings(const QString &codec, int bitrateKbit, int idleTimeoutSeconds)
 {
     AudioSettings settings;
     const QString c = codec.trimmed().toLower();
-    if (c == QLatin1String("auto")) {
-        settings.codec = Codec::Auto;
+    if (c == QLatin1String("pcm")) {
+        settings.codec = Codec::Pcm;
     } else if (c == QLatin1String("aac")) {
         settings.codec = Codec::Aac;
     } else if (c == QLatin1String("opus")) {
         settings.codec = Codec::Opus;
     } else {
-        settings.codec = Codec::Pcm;
+        settings.codec = Codec::Auto;
     }
+    settings.bitrateKbit = std::clamp(bitrateKbit, 32, 320);
     settings.idleTimeout = std::chrono::seconds(std::max(0, idleTimeoutSeconds));
     return settings;
 }
@@ -372,8 +371,8 @@ bool AudioStream::initialize()
         d->rdpsnd = nullptr;
     });
 
-    const AUDIO_FORMAT aac = audioFormat(WAVE_FORMAT_AAC_MS, s_aacSampleRate, s_aacBitrate / 8);
-    const AUDIO_FORMAT opus = audioFormat(WAVE_FORMAT_OPUS, 48000, s_opusBitrate / 8);
+    const AUDIO_FORMAT aac = audioFormat(WAVE_FORMAT_AAC_MS, s_aacSampleRate, s_settings.bitrateKbit * 1000 / 8);
+    const AUDIO_FORMAT opus = audioFormat(WAVE_FORMAT_OPUS, 48000, s_settings.bitrateKbit * 1000 / 8);
     const bool haveAac = freerdp_dsp_supports_format(&aac, TRUE);
     // FreeRDP's non-FFmpeg Opus encoder over-reports each packet's length by 4x (dsp.c, freerdp_dsp_encode_opus)
     const bool haveOpus = strstr(freerdp_get_build_config(), "WITH_DSP_FFMPEG=ON") && freerdp_dsp_supports_format(&opus, TRUE);
@@ -434,7 +433,8 @@ void AudioStream::handleMessages()
                           << d->pending.size() * 1000 / (s_blockAlign * d->sampleRate) << "ms";
         }
     }
-    if (d->currentRenderLatencyMs() > s_maxRenderLatencyMs) {
+    if (const auto latencyMs = d->currentRenderLatencyMs(); latencyMs > s_maxRenderLatencyMs) {
+        qCDebug(KRDP) << "Audio: client latency" << latencyMs << "ms is over" << s_maxRenderLatencyMs << "ms; dropping" << d->pending.size() * 1000 / (s_blockAlign * d->sampleRate) << "ms of buffered audio";
         d->pending.clear();
         d->clearBlockInfos();
     }

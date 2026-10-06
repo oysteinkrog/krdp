@@ -51,8 +51,14 @@ SPDX-License-Identifier: BSD-2-Clause
       <max>100</max>
     </entry>
     <entry name="audioCodec" key="AudioCodec" type="String">
-      <label>Audio codec: PCM (uncompressed 48 kHz, lossless, no encoder delay, about 1.5 Mbit/s), Auto (AAC, else Opus, else PCM), AAC or Opus</label>
-      <default>PCM</default>
+      <label>Audio codec: Auto (AAC, else Opus, else PCM), AAC, Opus or PCM (uncompressed 48 kHz; mstsc buffers it about 300 ms against 135 ms for AAC)</label>
+      <default>Auto</default>
+    </entry>
+    <entry name="audioBitrate" key="AudioBitrate" type="Int">
+      <label>AAC and Opus bit rate in kbit/s</label>
+      <default>192</default>
+      <min>32</min>
+      <max>320</max>
     </entry>
     <entry name="audioIdleTimeout" key="AudioIdleTimeout" type="Int">
       <label>Seconds of silence before the client's audio stream is closed; it reopens when sound returns. 0 keeps it open.</label>

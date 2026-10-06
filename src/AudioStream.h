@@ -19,16 +19,18 @@ class RdpConnection;
 /** Audio output settings from krdpserverrc. */
 struct KRDP_EXPORT AudioSettings {
     enum class Codec {
-        Pcm, ///< uncompressed 48 kHz, lossless and no encoder delay
         Auto, ///< AAC, else Opus, else PCM
+        Pcm, ///< uncompressed 48 kHz; mstsc buffers it about twice as long as AAC
         Aac,
         Opus,
     };
-    Codec codec = Codec::Pcm;
+    Codec codec = Codec::Auto;
+    /// Bit rate for AAC and Opus.
+    int bitrateKbit = 192;
     /// Close the client's audio stream after this much silence; 0 keeps it open.
     std::chrono::seconds idleTimeout{60};
 
-    static AudioSettings fromStrings(const QString &codec, int idleTimeoutSeconds);
+    static AudioSettings fromStrings(const QString &codec, int bitrateKbit, int idleTimeoutSeconds);
 };
 
 /** Server-to-client audio output (rdpsnd / MS-RDPEA) over a native PipeWire stream. */
