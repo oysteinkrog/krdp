@@ -528,6 +528,7 @@ bool VideoStream::initialize()
     connect(d->session->networkDetection(), &NetworkDetection::rttChanged, this, &VideoStream::updateInFlightWindow);
     connect(d->session->networkDetection(), &NetworkDetection::bandwidthChanged, this, &VideoStream::updateAdaptiveQuality);
 
+    updateInFlightWindow();
     d->frameSubmissionThread = std::jthread([this](std::stop_token token) {
         while (!token.stop_requested()) {
             if (!hasInFlightCapacity() || !d->gfxContext || !d->capsConfirmed || clk::steady_clock::now() < d->firstFrameNotBefore.load()) {
@@ -1124,6 +1125,12 @@ void VideoStream::updateInFlightWindow()
     // entering krdp; averageRTT() is published via atomics; both are safe to read here. The RTT
     // smoothing state is updated only from here, which the rttChanged connection invokes serially,
     // so no lock is needed. Falls back to the fixed floor until a valid RTT is known.
+    // For experiments: a fixed window, whatever the round-trip time.
+    static const qsizetype fixedWindow = qEnvironmentVariableIntValue("KRDP_MAX_IN_FLIGHT");
+    if (fixedWindow > 0) {
+        d->maxInFlight.store(fixedWindow);
+        return;
+    }
     const double fps = effectiveProducerFps();
     const double rttMs = clk::duration<double, std::milli>(d->session->networkDetection()->averageRTT()).count();
     qsizetype window = MaximumInFlightFrames;
