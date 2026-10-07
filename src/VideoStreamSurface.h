@@ -67,6 +67,10 @@ public:
                               const VideoFrame &frame,
                               quint64 resetGeneration);
 
+    /// Writes the next frames sent by sendFrameAvcGpu() to dir, for tools/avc444dumpdecode.
+    /// The caller makes the first one a key frame.
+    void startGpuDump(const QString &dir, std::chrono::seconds length);
+
     std::unique_ptr<PipeWireEncodedStream> encodedStream;
     std::unique_ptr<PipeWireSourceStream> sourceStream;
     DmaBufHandler dmaBufHandler;
@@ -95,6 +99,13 @@ public:
     bool gpuChromaSent = false;
     /// Encoded bytes of the last frame sent by an AVC path, for the latency log.
     quint32 lastFrameBytes = 0;
+    // Capture of the GPU AVC444 stream; only the frame submission thread touches it.
+    QString gpuDumpDir;
+    std::chrono::steady_clock::time_point gpuDumpUntil{};
+    int gpuDumpIndex = 0;
+    // Frames in GPU mode that came without a DMA-BUF and were dropped; see onFrameReceived().
+    quint64 gpuSkippedFrames = 0;
+    quint64 gpuConvertedFrames = 0;
     /// The union of changed tiles since the last encoded frame, up to and including sequence.
     /// Returns false if some changes were lost, in which case everything must be sent.
     bool takeGpuChanges(quint64 sequence, std::vector<uint8_t> &tiles);

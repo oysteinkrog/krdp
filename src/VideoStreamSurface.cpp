@@ -13,6 +13,8 @@
 #include <unistd.h>
 
 #include <QDateTime>
+#include <QDir>
+#include <QFile>
 #include <QScopeGuard>
 
 #include "krdp_logging.h"
@@ -296,6 +298,24 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
         frameData.presentationTimeStamp = clk::system_clock::time_point(clk::duration_cast<clk::microseconds>(*data.presentationTimestamp));
     }
 
+    if (!data.dmabuf && data.dataFrame && rawMode == VideoStream::EncodingMode::AVC444 && gpuAvc444Enabled() && !gpuFailed) {
+        // A frame in memory, not a DMA-BUF. The CPU path would encode it with FreeRDP's
+        // encoder, and two encoders feeding the client's one decoder garble the picture until
+        // the next key frame. Drop it: the next GPU frame is compared with the last converted
+        // one, so it still carries every change. Only fall back to the CPU for good if the
+        // stream never sends a DMA-BUF.
+        ++gpuSkippedFrames;
+        if (gpuSkippedFrames == 1 || gpuSkippedFrames % 100 == 0) {
+            qCWarning(KRDP) << "GPU AVC444: frame without a DMA-BUF; dropped" << gpuSkippedFrames << "so far";
+        }
+        if (gpuConvertedFrames == 0 && gpuSkippedFrames >= 60) {
+            qCWarning(KRDP) << "GPU AVC444: the stream sends no DMA-BUFs; using the CPU path";
+            gpuFailed = true;
+        } else {
+            return;
+        }
+    }
+
     if (data.dmabuf && rawMode == VideoStream::EncodingMode::AVC444 && gpuAvc444Enabled() && !gpuFailed) {
         if (!gpuConverter) {
             gpuConverter = std::make_unique<GpuAvc444Converter>();
@@ -305,6 +325,7 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
             qCWarning(KRDP) << "GPU encode: CUDA is not available; using the CPU path";
             gpuFailed = true;
         } else if (gpuConverter->convert(data, *picture, GpuAvc444Converter::Output::Cuda)) {
+            ++gpuConvertedFrames;
             frameData.gpuSequence = ++gpuSequence;
             {
                 std::lock_guard lock(gpuChangesMutex);
@@ -669,9 +690,52 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
         qCWarning(KRDP) << "SurfaceFrameCommand failed" << status << "frameId" << frameId << "surface" << surfaceCommand.surfaceId << "GPU AVC444";
     }
     lastFrameBytes = quint32(lumaData.size() + chromaData.size());
+    if (!gpuDumpDir.isEmpty()) {
+        // One file per frame, little endian: "KAV4", width, height, LC, then for the luma and
+        // the chroma picture: rect count, rects as left, top, right, bottom (uint16), byte
+        // count, H.264 data. A picture that was not sent has no rects and no data.
+        QFile file(QStringLiteral("%1/%2.bin").arg(gpuDumpDir).arg(gpuDumpIndex++, 6, 10, QLatin1Char('0')));
+        if (file.open(QIODevice::WriteOnly)) {
+            const auto put32 = [&](quint32 value) {
+                file.write(reinterpret_cast<const char *>(&value), sizeof(value));
+            };
+            const auto putPicture = [&](const std::vector<RECTANGLE_16> &rects, const QByteArray &data) {
+                const bool sent = !data.isEmpty();
+                put32(sent ? quint32(rects.size()) : 0);
+                for (size_t i = 0; sent && i < rects.size(); ++i) {
+                    file.write(reinterpret_cast<const char *>(&rects[i]), sizeof(RECTANGLE_16));
+                }
+                put32(quint32(data.size()));
+                file.write(data);
+            };
+            file.write("KAV4", 4);
+            put32(quint32(width));
+            put32(quint32(height));
+            put32(avc444Stream.LC);
+            putPicture(lumaRects, lumaData);
+            putPicture(chromaRects, chromaData);
+        }
+        if (std::chrono::steady_clock::now() >= gpuDumpUntil) {
+            qCWarning(KRDP) << "GPU AVC444: capture finished," << gpuDumpIndex << "frames in" << gpuDumpDir;
+            gpuDumpDir.clear();
+        }
+    }
     gpuLumaSent = gpuLumaSent || !lumaData.isEmpty();
     gpuChromaSent = gpuChromaSent || !chromaData.isEmpty();
     return AvcResult::Sent;
+}
+
+void VideoStreamSurface::startGpuDump(const QString &dir, std::chrono::seconds length)
+{
+    if (!QDir().mkpath(dir)) {
+        qCWarning(KRDP) << "GPU AVC444: cannot create" << dir;
+        return;
+    }
+    gpuDumpDir = dir;
+    gpuDumpIndex = 0;
+    gpuDumpUntil = std::chrono::steady_clock::now() + length;
+    qCWarning(KRDP) << "GPU AVC444: capturing the stream to" << dir << "for" << length.count() << "s;" << gpuConvertedFrames << "frames converted,"
+                    << gpuSkippedFrames << "dropped without a DMA-BUF";
 }
 
 bool VideoStreamSurface::sendFrameProgressive(RdpgfxServerContext *gfxContext, PROGRESSIVE_CONTEXT *progressive, uint32_t frameId, const VideoFrame &frame, quint64 resetGeneration)

@@ -19,6 +19,8 @@
 #include <optional>
 #include <thread>
 
+#include <QDateTime>
+#include <QFile>
 #include <QQueue>
 #include <QHash>
 
@@ -202,6 +204,7 @@ public:
     quint64 gpuKeyFrameGeneration = 0; // encoder generation of the last key frame
     clk::steady_clock::time_point gpuLastKeyFrame{};
     clk::steady_clock::time_point gpuLastSent{};
+    clk::steady_clock::time_point gpuDumpChecked{};
     VideoFrame gpuLastFrame; // sent again for a refresh when the screen does not change
     bool gpuRefreshDue(clk::steady_clock::time_point now) const;
     // The client said it stops acknowledging frames (SUSPEND_FRAME_ACKNOWLEDGEMENT).
@@ -1324,7 +1327,19 @@ void VideoStream::sendFrame(const VideoFrame &frame)
                 const quint32 qp = d->h264TargetQp.load();
                 if (d->gpuEncoder.ensure(frame.avc444->lumaFrame.get(), qp, d->requestedFrameRate.load(), d->gpuSpeed())) {
                     const auto now = clk::steady_clock::now();
-                    if (d->gpuKeyFrameNeeded.exchange(false) || d->gpuRefreshDue(now)) {
+                    // touch $XDG_RUNTIME_DIR/krdp-dump-now captures the next 10 s of the stream,
+                    // starting with a key frame, to /var/tmp/krdp-dump.
+                    bool dumpStarted = false;
+                    if (now - d->gpuDumpChecked >= clk::milliseconds(500)) {
+                        d->gpuDumpChecked = now;
+                        static const QString trigger = qEnvironmentVariable("XDG_RUNTIME_DIR") + QStringLiteral("/krdp-dump-now");
+                        if (QFile::exists(trigger) && QFile::remove(trigger)) {
+                            const QString dir = QStringLiteral("/var/tmp/krdp-dump/") + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
+                            d->surface->startGpuDump(dir, clk::seconds(10));
+                            dumpStarted = true;
+                        }
+                    }
+                    if (d->gpuKeyFrameNeeded.exchange(false) || d->gpuRefreshDue(now) || dumpStarted) {
                         d->gpuEncoder.requestKeyFrame();
                     }
                     if (d->gpuEncoder.generation() != d->gpuKeyFrameGeneration) {
