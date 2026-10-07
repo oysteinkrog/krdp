@@ -49,8 +49,8 @@ SPDX-License-Identifier: BSD-2-Clause
       <default>true</default>
     </entry>
     <entry name="keyFrameInterval" key="KeyFrameInterval" type="Int">
-      <label>GPU AVC444: seconds between full-screen key frames, so a client whose decoder got out of step recovers. 0 turns them off.</label>
-      <default>10</default>
+      <label>GPU AVC444: seconds between full-screen key frames. 0 turns them off; msrdc dropped the connection within minutes of getting them.</label>
+      <default>0</default>
     </entry>
     <entry name="remoteFxQuality" key="RemoteFXQuality" type="Int">
       <label>RemoteFX quality from 0 to 100. 100 keeps every detail, 50 is the Windows default.</label>

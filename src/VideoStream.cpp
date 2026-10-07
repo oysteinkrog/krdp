@@ -197,7 +197,7 @@ public:
     quint64 h264Generation = 0; ///< counts encoder (re)opens; each starts with a key frame
     // NVENC fed straight from the GPU converter's CUDA frames; see GpuH264Encoder.
     GpuH264Encoder gpuEncoder;
-    // The client needs a key frame on the GPU path: a forced IDR picture, not a new encoder.
+    // The client needs a key frame on the GPU path; sendFrame() opens a new encoder.
     std::atomic_bool gpuKeyFrameNeeded = false;
     GpuH264Encoder::Speed gpuSpeed() const;
     // Refresh key frames on the GPU path; only the frame submission thread touches these.
@@ -1339,7 +1339,14 @@ void VideoStream::sendFrame(const VideoFrame &frame)
                             dumpStarted = true;
                         }
                     }
-                    if (d->gpuKeyFrameNeeded.exchange(false) || d->gpuRefreshDue(now) || dumpStarted) {
+                    if (d->gpuKeyFrameNeeded.exchange(false) || dumpStarted) {
+                        // A new encoder, not a forced IDR picture: msrdc answered forced IDR
+                        // pictures after its graphics reset with another reset, about 6 in a
+                        // second, and then dropped the connection. The first picture of a new
+                        // encoder it always takes. Opening one costs about 100 ms.
+                        d->gpuEncoder.close();
+                        d->gpuEncoder.ensure(frame.avc444->lumaFrame.get(), qp, d->requestedFrameRate.load(), d->gpuSpeed());
+                    } else if (d->gpuRefreshDue(now)) {
                         d->gpuEncoder.requestKeyFrame();
                     }
                     if (d->gpuEncoder.generation() != d->gpuKeyFrameGeneration) {
