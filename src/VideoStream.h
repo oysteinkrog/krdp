@@ -55,9 +55,13 @@ struct KRDP_EXPORT VideoEncoderSettings {
     /// AVC444: convert and encode on the GPU (GL compute shader and NVENC from CUDA memory)
     /// when CUDA is available, instead of FreeRDP's CPU conversion. Ignored with libx264.
     bool gpuEncode = true;
+    /// GPU AVC444: seconds between full-screen key frames, so a client decoder that got out
+    /// of step recovers. 0 turns them off; then only a reconnect brings a key frame.
+    int keyFrameInterval = 10;
 
     /// Build settings from the values in krdpserverrc. Unknown values keep the default.
-    static VideoEncoderSettings fromStrings(const QString &codec, const QString &encoder, const QString &speed, int remoteFxQuality, bool gpuEncode);
+    static VideoEncoderSettings
+    fromStrings(const QString &codec, const QString &encoder, const QString &speed, int remoteFxQuality, bool gpuEncode, int keyFrameInterval);
 };
 
 /**

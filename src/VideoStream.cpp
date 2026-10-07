@@ -198,6 +198,14 @@ public:
     // The client needs a key frame on the GPU path: a forced IDR picture, not a new encoder.
     std::atomic_bool gpuKeyFrameNeeded = false;
     GpuH264Encoder::Speed gpuSpeed() const;
+    // Refresh key frames on the GPU path; only the frame submission thread touches these.
+    quint64 gpuKeyFrameGeneration = 0; // encoder generation of the last key frame
+    clk::steady_clock::time_point gpuLastKeyFrame{};
+    clk::steady_clock::time_point gpuLastSent{};
+    VideoFrame gpuLastFrame; // sent again for a refresh when the screen does not change
+    bool gpuRefreshDue(clk::steady_clock::time_point now) const;
+    // The client said it stops acknowledging frames (SUSPEND_FRAME_ACKNOWLEDGEMENT).
+    std::atomic_bool acksSuspended = false;
     /// Opens NVENC for a frame that is waiting, before frames may be sent; see sendFrame().
     void prepareGpuEncoder();
     bool nvencFailed = false;
@@ -289,7 +297,8 @@ static bool usesFreeRdpH264(std::optional<VideoStream::EncodingMode> mode)
 
 static VideoEncoderSettings s_encoderSettings;
 
-VideoEncoderSettings VideoEncoderSettings::fromStrings(const QString &codec, const QString &encoder, const QString &speed, int remoteFxQuality, bool gpuEncode)
+VideoEncoderSettings
+VideoEncoderSettings::fromStrings(const QString &codec, const QString &encoder, const QString &speed, int remoteFxQuality, bool gpuEncode, int keyFrameInterval)
 {
     VideoEncoderSettings settings;
     const auto is = [](const QString &value, QLatin1StringView name) {
@@ -326,6 +335,7 @@ VideoEncoderSettings VideoEncoderSettings::fromStrings(const QString &codec, con
 
     settings.remoteFxQuality = std::clamp(remoteFxQuality, 0, 100);
     settings.gpuEncode = gpuEncode;
+    settings.keyFrameInterval = std::max(0, keyFrameInterval);
     return settings;
 }
 
@@ -361,6 +371,12 @@ GpuH264Encoder::Speed VideoStream::Private::gpuSpeed() const
         break;
     }
     return GpuH264Encoder::Speed::Fast;
+}
+
+bool VideoStream::Private::gpuRefreshDue(clk::steady_clock::time_point now) const
+{
+    const int interval = encoderSettings().keyFrameInterval;
+    return interval > 0 && gpuLastKeyFrame != clk::steady_clock::time_point{} && now - gpuLastKeyFrame >= clk::seconds(interval);
 }
 
 void VideoStream::Private::prepareGpuEncoder()
@@ -546,6 +562,19 @@ bool VideoStream::initialize()
                 }
             }
             if (nextFrame.size.isEmpty()) {
+                // A refresh key frame is due but the screen does not change: send the last
+                // frame again, so a broken picture on the client still recovers.
+                const auto now = clk::steady_clock::now();
+                bool sameSize = false;
+                if (d->gpuLastFrame.avc444 && !d->surface->gpuFailed && d->gpuRefreshDue(now) && now - d->gpuLastSent >= clk::milliseconds(500)) {
+                    std::lock_guard frameLock(d->surface->frameMutex);
+                    sameSize = d->surface->surface.size == d->gpuLastFrame.size;
+                }
+                if (sameSize) {
+                    const VideoFrame frame = d->gpuLastFrame;
+                    sendFrame(frame);
+                    continue;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1000) / d->requestedFrameRate.load());
                 continue;
             }
@@ -575,6 +604,7 @@ void VideoStream::close()
         d->frameSubmissionThread.request_stop();
         d->frameSubmissionThread.join();
     }
+    d->gpuLastFrame = VideoFrame();
 
     {
         std::lock_guard lock(d->pendingFramesMutex);
@@ -906,6 +936,22 @@ uint32_t VideoStream::onFrameAcknowledge(const RDPGFX_FRAME_ACKNOWLEDGE_PDU *fra
 
     std::lock_guard lock(d->pendingFramesMutex);
 
+    // [MS-RDPEGFX] 2.2.2.13: with this queue depth the client stops acknowledging frames, and
+    // the server sends without waiting. A later normal acknowledgement turns that off again.
+    // The client may have dropped its decoder meanwhile (a minimized or hidden window), so
+    // send a key frame when it comes back.
+    if (frameAcknowledge->queueDepth == SUSPEND_FRAME_ACKNOWLEDGEMENT) {
+        if (!d->acksSuspended.exchange(true)) {
+            qCInfo(KRDP) << "Client suspended frame acknowledgements";
+        }
+        d->pendingFrames.clear();
+        return CHANNEL_RC_OK;
+    }
+    if (d->acksSuspended.exchange(false)) {
+        qCInfo(KRDP) << "Client resumed frame acknowledgements; sending a key frame";
+        d->gpuKeyFrameNeeded = true;
+    }
+
     auto itr = d->pendingFrames.constFind(id);
     if (itr == d->pendingFrames.cend()) {
         qCWarning(KRDP) << "Got frame acknowledge for an unknown frame";
@@ -1217,7 +1263,7 @@ void VideoStream::updateAdaptiveQuality()
 bool VideoStream::hasInFlightCapacity() const
 {
     std::lock_guard lock(d->pendingFramesMutex);
-    return d->pendingFrames.size() < d->maxInFlight.load();
+    return d->acksSuspended || d->pendingFrames.size() < d->maxInFlight.load();
 }
 
 void VideoStream::sendFrame(const VideoFrame &frame)
@@ -1262,7 +1308,9 @@ void VideoStream::sendFrame(const VideoFrame &frame)
     const auto frameId = d->frameId++;
     {
         std::lock_guard lock(d->pendingFramesMutex);
-        d->pendingFrames.insert(frameId, Private::PendingFrame{.sent = clk::steady_clock::now()});
+        if (!d->acksSuspended) {
+            d->pendingFrames.insert(frameId, Private::PendingFrame{.sent = clk::steady_clock::now()});
+        }
     }
 
     bool submitted = false;
@@ -1275,8 +1323,15 @@ void VideoStream::sendFrame(const VideoFrame &frame)
             if (avc444 && frame.avc444 && frame.avc444->lumaFrame) {
                 const quint32 qp = d->h264TargetQp.load();
                 if (d->gpuEncoder.ensure(frame.avc444->lumaFrame.get(), qp, d->requestedFrameRate.load(), d->gpuSpeed())) {
-                    if (d->gpuKeyFrameNeeded.exchange(false)) {
+                    const auto now = clk::steady_clock::now();
+                    if (d->gpuKeyFrameNeeded.exchange(false) || d->gpuRefreshDue(now)) {
                         d->gpuEncoder.requestKeyFrame();
+                    }
+                    if (d->gpuEncoder.generation() != d->gpuKeyFrameGeneration) {
+                        // A new encoder or a requested key frame: this frame is a key frame,
+                        // sent in full (see sendFrameAvcGpu()).
+                        d->gpuKeyFrameGeneration = d->gpuEncoder.generation();
+                        d->gpuLastKeyFrame = now;
                     }
                     const auto &picture = *frame.avc444;
                     result = d->surface->sendFrameAvcGpu(
@@ -1289,6 +1344,10 @@ void VideoStream::sendFrame(const VideoFrame &frame)
                         frameId,
                         frame,
                         resetGeneration);
+                    if (result == VideoStreamSurface::AvcResult::Sent) {
+                        d->gpuLastFrame = frame;
+                        d->gpuLastSent = now;
+                    }
                 }
                 if (result == VideoStreamSurface::AvcResult::Failed) {
                     // Go back to the CPU path for the next frames; this frame is lost.

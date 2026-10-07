@@ -48,6 +48,10 @@ SPDX-License-Identifier: BSD-2-Clause
       <label>AVC444: convert and encode on the GPU with NVENC when CUDA is available, instead of on the CPU. Ignored with the libx264 encoder.</label>
       <default>true</default>
     </entry>
+    <entry name="keyFrameInterval" key="KeyFrameInterval" type="Int">
+      <label>GPU AVC444: seconds between full-screen key frames, so a client whose decoder got out of step recovers. 0 turns them off.</label>
+      <default>10</default>
+    </entry>
     <entry name="remoteFxQuality" key="RemoteFXQuality" type="Int">
       <label>RemoteFX quality from 0 to 100. 100 keeps every detail, 50 is the Windows default.</label>
       <default>100</default>

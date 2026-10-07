@@ -176,7 +176,7 @@ int main(int argc, char **argv)
 
     KRdp::AudioStream::setSettings(KRdp::AudioSettings::fromStrings(config->audioCodec(), config->audioBitrate(), config->audioIdleTimeout()));
     KRdp::VideoStream::setEncoderSettings(
-        KRdp::VideoEncoderSettings::fromStrings(config->videoCodec(), config->videoEncoder(), config->encoderSpeed(), config->remoteFxQuality(), config->gpuEncode()));
+        KRdp::VideoEncoderSettings::fromStrings(config->videoCodec(), config->videoEncoder(), config->encoderSpeed(), config->remoteFxQuality(), config->gpuEncode(), config->keyFrameInterval()));
 
     if (!server.start()) {
         return -1;
