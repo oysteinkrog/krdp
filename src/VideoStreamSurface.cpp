@@ -706,10 +706,17 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
         }
         return rects;
     };
-    const auto lumaRects = changedRects(GpuAvc444Picture::LumaChanged, !complete || !gpuLumaSent);
+    auto lumaRects = changedRects(GpuAvc444Picture::LumaChanged, !complete || !gpuLumaSent);
     const auto chromaRects = changedRects(GpuAvc444Picture::ChromaChanged, !complete || !gpuChromaSent);
     if (lumaRects.empty() && chromaRects.empty()) {
         return AvcResult::Unchanged;
+    }
+    if (lumaRects.empty()) {
+        // Never send only the chroma picture (LC 2). msrdc rejects such a frame
+        // (WireDecoderError_DecodeW2S1AvcDecodeFail, E_INVALIDARG), resets its graphics, and
+        // after a few of those drops the connection. Send the luma picture of the same area
+        // with it, which makes it an LC 0 frame.
+        lumaRects = chromaRects;
     }
 
     // Both pictures go through the one encoder, as one H.264 stream: the client decodes
