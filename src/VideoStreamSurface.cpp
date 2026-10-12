@@ -559,6 +559,104 @@ VideoStreamSurface::sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *
     return AvcResult::Sent;
 }
 
+// Describes one H.264 picture as sent: its NAL unit types, the slice type and whether it
+// is an IDR picture. Rule breaks are marked with '!', for example a rect outside the surface
+// or two pictures in one bitstream. Either makes a client decoder reject the frame.
+static QByteArray checkAvcPicture(const std::vector<RECTANGLE_16> &rects, const QByteArray &data, int width, int height, quint32 qp)
+{
+    QByteArray out;
+    if (rects.empty()) {
+        out += " !no-rects";
+    }
+    for (const auto &rect : rects) {
+        if (rect.left >= rect.right || rect.top >= rect.bottom || rect.right > width || rect.bottom > height) {
+            out += " !rect:" + QByteArray::number(rect.left) + ',' + QByteArray::number(rect.top) + ',' + QByteArray::number(rect.right) + ','
+                + QByteArray::number(rect.bottom);
+        }
+    }
+    if ((qp & 0x3F) > 51) {
+        out += " !qp:" + QByteArray::number(qp & 0x3F);
+    }
+
+    const auto *bytes = reinterpret_cast<const uint8_t *>(data.constData());
+    const qsizetype size = data.size();
+    if (size < 4 || !(bytes[0] == 0 && bytes[1] == 0 && (bytes[2] == 1 || (bytes[2] == 0 && bytes[3] == 1)))) {
+        out += " !no-start-code";
+    }
+    int slices = 0;
+    int pictures = 0;
+    out += " nal:";
+    for (qsizetype i = 0; i + 3 < size; ++i) {
+        if (bytes[i] != 0 || bytes[i + 1] != 0 || bytes[i + 2] != 1) {
+            continue;
+        }
+        const qsizetype nal = i + 3;
+        const uint8_t header = bytes[nal];
+        const int type = header & 0x1F;
+        out += QByteArray::number(type) + ',';
+        if (header & 0x80) {
+            out += "!forbidden-bit,";
+        }
+        if (type == 1 || type == 5) {
+            ++slices;
+            // first_mb_in_slice and slice_type, both ue(v), from the RBSP after the header.
+            qsizetype pos = nal + 1;
+            int zeros = 0;
+            int bit = 8;
+            uint8_t current = 0;
+            bool ended = false;
+            const auto nextBit = [&]() -> int {
+                if (bit == 8) {
+                    if (pos >= size) {
+                        ended = true;
+                        return 0;
+                    }
+                    current = bytes[pos++];
+                    if (zeros >= 2 && current == 3) {
+                        zeros = 0;
+                        if (pos >= size) {
+                            ended = true;
+                            return 0;
+                        }
+                        current = bytes[pos++];
+                    }
+                    zeros = current == 0 ? zeros + 1 : 0;
+                    bit = 0;
+                }
+                return (current >> (7 - bit++)) & 1;
+            };
+            const auto ue = [&]() -> quint32 {
+                int leading = 0;
+                while (!ended && leading < 32 && nextBit() == 0) {
+                    ++leading;
+                }
+                quint32 value = 0;
+                for (int k = 0; k < leading; ++k) {
+                    value = value << 1 | quint32(nextBit());
+                }
+                return (1u << leading) - 1 + value;
+            };
+            const quint32 firstMb = ue();
+            const quint32 sliceType = ue();
+            if (firstMb == 0) {
+                ++pictures;
+            }
+            static const char *const names[] = {"P", "B", "I", "SP", "SI"};
+            out += type == 5 ? "idr-" : "";
+            out += sliceType < 10 ? names[sliceType % 5] : "?";
+            out += ',';
+        }
+        i = nal;
+    }
+    if (slices == 0) {
+        out += " !no-slice";
+    }
+    if (pictures > 1) {
+        out += " !" + QByteArray::number(pictures) + "-pictures";
+    }
+    return out.trimmed();
+}
+
 VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerContext *gfxContext,
                                                                   const AvcEncode &encode,
                                                                   quint64 encoderGeneration,
@@ -690,35 +788,75 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
         qCWarning(KRDP) << "SurfaceFrameCommand failed" << status << "frameId" << frameId << "surface" << surfaceCommand.surfaceId << "GPU AVC444";
     }
     lastFrameBytes = quint32(lumaData.size() + chromaData.size());
+
+    // Check what was sent against the rules a client decoder applies, so a stream the client
+    // rejects shows up in the log. msrdc drops the connection after a few rejected frames.
+    const QByteArray lumaCheck = lumaData.isEmpty() ? QByteArray() : checkAvcPicture(lumaRects, lumaData, width, height, qp);
+    const QByteArray chromaCheck = chromaData.isEmpty() ? QByteArray() : checkAvcPicture(chromaRects, chromaData, width, height, qp);
+    const bool invalid = lumaCheck.contains('!') || chromaCheck.contains('!');
+    if (invalid && (++gpuInvalidFrames <= 20 || gpuInvalidFrames % 1000 == 0)) {
+        qCWarning(KRDP) << "GPU AVC444: frame" << frameId << "breaks the rules (" << gpuInvalidFrames << "so far): luma" << lumaCheck.constData()
+                        << "chroma" << chromaCheck.constData();
+    }
+
+    // One record per frame, little endian: "KAV4", width, height, LC, then for the luma and
+    // the chroma picture: rect count, rects as left, top, right, bottom (uint16), byte
+    // count, H.264 data. A picture that was not sent has no rects and no data.
+    QByteArray record;
+    {
+        const auto put32 = [&](quint32 value) {
+            record.append(reinterpret_cast<const char *>(&value), sizeof(value));
+        };
+        const auto putPicture = [&](const std::vector<RECTANGLE_16> &rects, const QByteArray &data) {
+            const bool sent = !data.isEmpty();
+            put32(sent ? quint32(rects.size()) : 0);
+            for (size_t i = 0; sent && i < rects.size(); ++i) {
+                record.append(reinterpret_cast<const char *>(&rects[i]), sizeof(RECTANGLE_16));
+            }
+            put32(quint32(data.size()));
+            record.append(data);
+        };
+        record.reserve(64 + lumaData.size() + chromaData.size() + 8 * (lumaRects.size() + chromaRects.size()));
+        record.append("KAV4", 4);
+        put32(quint32(width));
+        put32(quint32(height));
+        put32(avc444Stream.LC);
+        putPicture(lumaRects, lumaData);
+        putPicture(chromaRects, chromaData);
+    }
+
     if (!gpuDumpDir.isEmpty()) {
-        // One file per frame, little endian: "KAV4", width, height, LC, then for the luma and
-        // the chroma picture: rect count, rects as left, top, right, bottom (uint16), byte
-        // count, H.264 data. A picture that was not sent has no rects and no data.
         QFile file(QStringLiteral("%1/%2.bin").arg(gpuDumpDir).arg(gpuDumpIndex++, 6, 10, QLatin1Char('0')));
         if (file.open(QIODevice::WriteOnly)) {
-            const auto put32 = [&](quint32 value) {
-                file.write(reinterpret_cast<const char *>(&value), sizeof(value));
-            };
-            const auto putPicture = [&](const std::vector<RECTANGLE_16> &rects, const QByteArray &data) {
-                const bool sent = !data.isEmpty();
-                put32(sent ? quint32(rects.size()) : 0);
-                for (size_t i = 0; sent && i < rects.size(); ++i) {
-                    file.write(reinterpret_cast<const char *>(&rects[i]), sizeof(RECTANGLE_16));
-                }
-                put32(quint32(data.size()));
-                file.write(data);
-            };
-            file.write("KAV4", 4);
-            put32(quint32(width));
-            put32(quint32(height));
-            put32(avc444Stream.LC);
-            putPicture(lumaRects, lumaData);
-            putPicture(chromaRects, chromaData);
+            file.write(record);
         }
         if (std::chrono::steady_clock::now() >= gpuDumpUntil) {
             qCWarning(KRDP) << "GPU AVC444: capture finished," << gpuDumpIndex << "frames in" << gpuDumpDir;
             gpuDumpDir.clear();
         }
+    }
+
+    // Keep the frames since the last key frame for saveRecentGpuFrames(), up to 48 MB.
+    const bool keyFrame = lumaCheck.contains("idr") || chromaCheck.contains("idr");
+    if (keyFrame) {
+        gpuRecent.clear();
+        gpuRecentBytes = 0;
+        gpuRecentTrimmed = false;
+    }
+    QByteArray indexLine = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz")).toLatin1();
+    indexLine += " frame " + QByteArray::number(frameId) + " LC " + QByteArray::number(avc444Stream.LC) + " qp " + QByteArray::number(qp);
+    indexLine += " luma " + QByteArray::number(lumaRects.size()) + " rects " + QByteArray::number(lumaData.size()) + " bytes [" + lumaCheck + "]";
+    indexLine += " chroma " + QByteArray::number(chromaRects.size()) + " rects " + QByteArray::number(chromaData.size()) + " bytes [" + chromaCheck + "]";
+    if (status != CHANNEL_RC_OK) {
+        indexLine += " send failed " + QByteArray::number(status);
+    }
+    indexLine += '\n';
+    gpuRecentBytes += record.size() + indexLine.size();
+    gpuRecent.push_back({std::move(record), std::move(indexLine)});
+    while (gpuRecentBytes > 48 * 1024 * 1024 && gpuRecent.size() > 1) {
+        gpuRecentBytes -= gpuRecent.front().record.size() + gpuRecent.front().indexLine.size();
+        gpuRecent.pop_front();
+        gpuRecentTrimmed = true;
     }
     gpuLumaSent = gpuLumaSent || !lumaData.isEmpty();
     gpuChromaSent = gpuChromaSent || !chromaData.isEmpty();
@@ -736,6 +874,47 @@ void VideoStreamSurface::startGpuDump(const QString &dir, std::chrono::seconds l
     gpuDumpUntil = std::chrono::steady_clock::now() + length;
     qCWarning(KRDP) << "GPU AVC444: capturing the stream to" << dir << "for" << length.count() << "s;" << gpuConvertedFrames << "frames converted,"
                     << gpuSkippedFrames << "dropped without a DMA-BUF";
+}
+
+void VideoStreamSurface::saveRecentGpuFrames(const char *reason)
+{
+    if (gpuRecent.empty()) {
+        return;
+    }
+    // At most 50 per connection, and the newest 40 on disk, each up to 48 MB.
+    if (gpuAutoDumps >= 50) {
+        gpuRecent.clear();
+        gpuRecentBytes = 0;
+        return;
+    }
+    QDir dumps(QStringLiteral("/var/tmp/krdp-dump"));
+    const QStringList old = dumps.entryList({QStringLiteral("auto-*")}, QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (qsizetype i = 0; i + 39 < old.size(); ++i) {
+        QDir(dumps.filePath(old[i])).removeRecursively();
+    }
+    const QString dir = QStringLiteral("/var/tmp/krdp-dump/auto-") + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss-zzz"));
+    if (!QDir().mkpath(dir)) {
+        qCWarning(KRDP) << "GPU AVC444: cannot create" << dir;
+        return;
+    }
+    ++gpuAutoDumps;
+    QFile index(dir + QStringLiteral("/index.txt"));
+    if (index.open(QIODevice::WriteOnly)) {
+        index.write(QByteArray("# ") + reason + (gpuRecentTrimmed ? ", oldest frames dropped (the first one is not a key frame)\n" : "\n"));
+    }
+    int number = 0;
+    for (const auto &frame : gpuRecent) {
+        QFile file(QStringLiteral("%1/%2.bin").arg(dir).arg(number, 6, 10, QLatin1Char('0')));
+        if (file.open(QIODevice::WriteOnly)) {
+            file.write(frame.record);
+        }
+        index.write(QByteArray::number(number).rightJustified(6, '0') + ' ' + frame.indexLine);
+        ++number;
+    }
+    qCWarning(KRDP) << "GPU AVC444:" << reason << "; saved the last" << number << "frames to" << dir;
+    gpuRecent.clear();
+    gpuRecentBytes = 0;
+    gpuRecentTrimmed = false;
 }
 
 bool VideoStreamSurface::sendFrameProgressive(RdpgfxServerContext *gfxContext, PROGRESSIVE_CONTEXT *progressive, uint32_t frameId, const VideoFrame &frame, quint64 resetGeneration)

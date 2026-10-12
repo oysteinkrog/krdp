@@ -607,6 +607,7 @@ void VideoStream::close()
         d->frameSubmissionThread.request_stop();
         d->frameSubmissionThread.join();
     }
+    d->surface->saveRecentGpuFrames("connection closed");
     d->gpuLastFrame = VideoFrame();
 
     {
@@ -764,6 +765,7 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         // Tell a frame that is being encoded not to send, then wait for it to finish.
         ++d->surface->resetGeneration;
         frameLock.lock();
+        d->surface->saveRecentGpuFrames("client reset its graphics");
         d->capsConfirmed = false;
         d->surface->pendingReset = true;
         // A client that re-advertises has already dropped its GFX state. Sending it

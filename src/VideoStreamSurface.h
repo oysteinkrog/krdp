@@ -70,6 +70,10 @@ public:
     /// Writes the next frames sent by sendFrameAvcGpu() to dir, for tools/avc444dumpdecode.
     /// The caller makes the first one a key frame.
     void startGpuDump(const QString &dir, std::chrono::seconds length);
+    /// Writes the frames kept since the last key frame to /var/tmp/krdp-dump/auto-<time>/,
+    /// in the startGpuDump() format plus an index.txt, and forgets them. Called when the
+    /// client resets its graphics, so the frames it may have failed to decode are kept.
+    void saveRecentGpuFrames(const char *reason);
 
     std::unique_ptr<PipeWireEncodedStream> encodedStream;
     std::unique_ptr<PipeWireSourceStream> sourceStream;
@@ -103,6 +107,17 @@ public:
     QString gpuDumpDir;
     std::chrono::steady_clock::time_point gpuDumpUntil{};
     int gpuDumpIndex = 0;
+    // The frames sent since the last key frame, as capture records, with one index line
+    // each. Only the frame submission thread and a client reset (under frameMutex) touch it.
+    struct RecentFrame {
+        QByteArray record;
+        QByteArray indexLine;
+    };
+    std::deque<RecentFrame> gpuRecent;
+    qsizetype gpuRecentBytes = 0;
+    bool gpuRecentTrimmed = false;
+    int gpuAutoDumps = 0;
+    quint64 gpuInvalidFrames = 0;
     // Frames in GPU mode that came without a DMA-BUF and were dropped; see onFrameReceived().
     quint64 gpuSkippedFrames = 0;
     quint64 gpuConvertedFrames = 0;
