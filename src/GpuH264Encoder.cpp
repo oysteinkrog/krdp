@@ -71,6 +71,11 @@ bool GpuH264Encoder::ensure(const AVFrame *frame, quint32 qp, int frameRate, Spe
     m_context->pix_fmt = AV_PIX_FMT_CUDA;
     m_context->hw_frames_ctx = av_buffer_ref(frame->hw_frames_ctx);
     m_context->max_b_frames = 0;
+    // KRDP_GPU_REFS limits the reference pictures (NVENC picks 3 by default), to test
+    // whether a client mishandles multi-reference P pictures across the two AVC444 views.
+    if (const int refs = qEnvironmentVariableIntValue("KRDP_GPU_REFS"); refs > 0) {
+        m_context->refs = refs;
+    }
     // FFmpeg leaves the GOP to the preset (g = -1), and with tune ull NVENC never inserts a
     // periodic key frame. That is what we want: every reset of the client's graphics opens a
     // new encoder, which starts with one. tools/gpuavc444test checks it.
@@ -99,7 +104,7 @@ bool GpuH264Encoder::ensure(const AVFrame *frame, quint32 qp, int frameRate, Spe
     m_pts = 0;
     m_keyFrameRequested = false;
     ++m_generation;
-    qCDebug(KRDP) << "GPU encode: h264_nvenc" << size << "QP" << qp << "preset" << preset;
+    qCDebug(KRDP) << "GPU encode: h264_nvenc" << size << "QP" << qp << "preset" << preset << "refs" << m_context->refs;
     return true;
 }
 

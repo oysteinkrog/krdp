@@ -495,7 +495,9 @@ VideoStreamSurface::sendFrameAvc(RdpgfxServerContext *gfxContext, H264_CONTEXT *
         }
         // Size of the first stream as written on the wire: numRegionRects, then 8 bytes of
         // rectangle and 2 of quant/quality per region, then the H.264 data.
-        avc444Stream.cbAvc420EncodedBitstream1 = 4 + 10 * avc444Stream.bitstream[0].meta.numRegionRects + avc444Stream.bitstream[0].length;
+        // [MS-RDPEGFX] 2.2.4.6: zero when there is no YUV420 frame (LC 2).
+        avc444Stream.cbAvc420EncodedBitstream1 =
+            avc444Stream.LC == 2 ? 0 : 4 + 10 * avc444Stream.bitstream[0].meta.numRegionRects + avc444Stream.bitstream[0].length;
         surfaceCommand.codecId = RDPGFX_CODECID_AVC444v2;
         surfaceCommand.extra = &avc444Stream;
     } else {
@@ -707,9 +709,20 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
         return rects;
     };
     auto lumaRects = changedRects(GpuAvc444Picture::LumaChanged, !complete || !gpuLumaSent);
-    const auto chromaRects = changedRects(GpuAvc444Picture::ChromaChanged, !complete || !gpuChromaSent);
+    auto chromaRects = changedRects(GpuAvc444Picture::ChromaChanged, !complete || !gpuChromaSent);
     if (lumaRects.empty() && chromaRects.empty()) {
         return AvcResult::Unchanged;
+    }
+    // Test switches for the purple corruption on Windows clients. KRDP_AVC444_SAME_RECTS
+    // sends both pictures with the same rects (the tiles where either changed), so every
+    // frame is LC 0 with identical lists. KRDP_AVC444_FULL_RECTS also makes those rects the
+    // whole surface.
+    static const bool sameRects = qEnvironmentVariableIntValue("KRDP_AVC444_SAME_RECTS") != 0;
+    static const bool fullRects = qEnvironmentVariableIntValue("KRDP_AVC444_FULL_RECTS") != 0;
+    if (sameRects || fullRects) {
+        const bool everything = fullRects || !complete || !gpuLumaSent || !gpuChromaSent;
+        lumaRects = changedRects(GpuAvc444Picture::LumaChanged | GpuAvc444Picture::ChromaChanged, everything);
+        chromaRects = lumaRects;
     }
     if (lumaRects.empty()) {
         // Never send only the chroma picture (LC 2). msrdc rejects such a frame
@@ -759,7 +772,9 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
         avc444Stream.LC = 2;
         avc444Stream.bitstream[0] = makeStream(chromaRects, chromaData);
     }
-    avc444Stream.cbAvc420EncodedBitstream1 = 4 + 10 * avc444Stream.bitstream[0].meta.numRegionRects + avc444Stream.bitstream[0].length;
+    // [MS-RDPEGFX] 2.2.4.6: zero when there is no YUV420 frame (LC 2).
+    avc444Stream.cbAvc420EncodedBitstream1 =
+        avc444Stream.LC == 2 ? 0 : 4 + 10 * avc444Stream.bitstream[0].meta.numRegionRects + avc444Stream.bitstream[0].length;
     const auto freeMetablocks = qScopeGuard([&]() {
         free_h264_metablock(&avc444Stream.bitstream[0].meta);
         free_h264_metablock(&avc444Stream.bitstream[1].meta);
