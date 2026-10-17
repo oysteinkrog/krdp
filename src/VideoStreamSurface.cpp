@@ -713,11 +713,12 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
     if (lumaRects.empty() && chromaRects.empty()) {
         return AvcResult::Unchanged;
     }
-    // Test switches for the purple corruption on Windows clients. KRDP_AVC444_SAME_RECTS
-    // sends both pictures with the same rects (the tiles where either changed), so every
-    // frame is LC 0 with identical lists. KRDP_AVC444_FULL_RECTS also makes those rects the
-    // whole surface.
-    static const bool sameRects = qEnvironmentVariableIntValue("KRDP_AVC444_SAME_RECTS") != 0;
+    // Send both pictures with the same rects: the tiles where either changed, so every frame
+    // is LC 0 with identical lists. With separate lists, mstsc and msrdc drew changed areas
+    // purple within minutes and kept doing so until a reconnect, although FreeRDP decodes
+    // that stream cleanly. KRDP_AVC444_SAME_RECTS=0 brings separate lists back for testing.
+    // KRDP_AVC444_FULL_RECTS=1 makes the rects the whole surface.
+    static const bool sameRects = qEnvironmentVariable("KRDP_AVC444_SAME_RECTS") != QLatin1String("0");
     static const bool fullRects = qEnvironmentVariableIntValue("KRDP_AVC444_FULL_RECTS") != 0;
     if (sameRects || fullRects) {
         const bool everything = fullRects || !complete || !gpuLumaSent || !gpuChromaSent;
