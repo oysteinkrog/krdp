@@ -859,7 +859,14 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
         }
     }
 
-    // Keep the frames since the last key frame for saveRecentGpuFrames(), up to 48 MB.
+    // With KRDP_AUTO_DUMP=1, keep the frames since the last key frame for
+    // saveRecentGpuFrames(), up to 48 MB. Off by default: the saved frames are screen content.
+    static const bool autoDump = qEnvironmentVariableIntValue("KRDP_AUTO_DUMP") != 0;
+    if (!autoDump) {
+        gpuLumaSent = gpuLumaSent || !lumaData.isEmpty();
+        gpuChromaSent = gpuChromaSent || !chromaData.isEmpty();
+        return AvcResult::Sent;
+    }
     const bool keyFrame = lumaCheck.contains("idr") || chromaCheck.contains("idr");
     if (keyFrame) {
         gpuRecent.clear();

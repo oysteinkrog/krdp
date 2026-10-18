@@ -73,6 +73,7 @@ public:
     /// Writes the frames kept since the last key frame to /var/tmp/krdp-dump/auto-<time>/,
     /// in the startGpuDump() format plus an index.txt, and forgets them. Called when the
     /// client resets its graphics, so the frames it may have failed to decode are kept.
+    /// Only with KRDP_AUTO_DUMP=1; otherwise no frames are kept.
     void saveRecentGpuFrames(const char *reason);
 
     std::unique_ptr<PipeWireEncodedStream> encodedStream;
