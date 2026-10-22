@@ -860,7 +860,8 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
     }
 
     // With KRDP_AUTO_DUMP=1, keep the frames since the last key frame for
-    // saveRecentGpuFrames(), up to 48 MB. Off by default: the saved frames are screen content.
+    // saveRecentGpuFrames(), up to KRDP_AUTO_DUMP_MB (48 MB by default). Off by default: the
+    // saved frames are screen content.
     static const bool autoDump = qEnvironmentVariableIntValue("KRDP_AUTO_DUMP") != 0;
     if (!autoDump) {
         gpuLumaSent = gpuLumaSent || !lumaData.isEmpty();
@@ -883,7 +884,8 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
     indexLine += '\n';
     gpuRecentBytes += record.size() + indexLine.size();
     gpuRecent.push_back({std::move(record), std::move(indexLine)});
-    while (gpuRecentBytes > 48 * 1024 * 1024 && gpuRecent.size() > 1) {
+    static const qint64 recentLimit = qint64(qEnvironmentVariableIsSet("KRDP_AUTO_DUMP_MB") ? qEnvironmentVariableIntValue("KRDP_AUTO_DUMP_MB") : 48) * 1024 * 1024;
+    while (gpuRecentBytes > recentLimit && gpuRecent.size() > 1) {
         gpuRecentBytes -= gpuRecent.front().record.size() + gpuRecent.front().indexLine.size();
         gpuRecent.pop_front();
         gpuRecentTrimmed = true;
@@ -911,7 +913,7 @@ void VideoStreamSurface::saveRecentGpuFrames(const char *reason)
     if (gpuRecent.empty()) {
         return;
     }
-    // At most 50 per connection, and the newest 40 on disk, each up to 48 MB.
+    // At most 50 per connection, and the newest 40 on disk, each up to KRDP_AUTO_DUMP_MB.
     if (gpuAutoDumps >= 50) {
         gpuRecent.clear();
         gpuRecentBytes = 0;

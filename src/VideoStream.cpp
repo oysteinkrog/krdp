@@ -1317,6 +1317,9 @@ void VideoStream::sendFrame(const VideoFrame &frame)
         for (const auto &[name, withReset] : {std::pair{QStringLiteral("/krdp-reset-now"), true}, std::pair{QStringLiteral("/krdp-surface-now"), false}}) {
             if (QFile::exists(runtimeDir + name) && QFile::remove(runtimeDir + name)) {
                 qCWarning(KRDP) << "New surface on request" << (withReset ? "after ResetGraphics" : "without ResetGraphics");
+                // With KRDP_AUTO_DUMP=1, keep the stream that led here, for replay through
+                // another decoder.
+                d->surface->saveRecentGpuFrames("new surface on request");
                 d->surface->pendingReset = true;
                 resetGraphics = withReset;
             }
