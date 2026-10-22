@@ -165,7 +165,7 @@ private:
     void failVideoInitialization();
     void destroySurface();
     void forgetSurface();
-    void performReset(QSize size);
+    void performReset(QSize size, bool resetGraphics = true);
     bool hasInFlightCapacity() const;
     void sendFrame(const VideoFrame &frame);
 

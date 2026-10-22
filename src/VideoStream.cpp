@@ -205,6 +205,7 @@ public:
     clk::steady_clock::time_point gpuLastKeyFrame{};
     clk::steady_clock::time_point gpuLastSent{};
     clk::steady_clock::time_point gpuDumpChecked{};
+    clk::steady_clock::time_point resetChecked{};
     VideoFrame gpuLastFrame; // sent again for a refresh when the screen does not change
     bool gpuRefreshDue(clk::steady_clock::time_point now) const;
     // The client said it stops acknowledging frames (SUSPEND_FRAME_ACKNOWLEDGEMENT).
@@ -1057,7 +1058,7 @@ void VideoStream::forgetSurface()
     surface = Surface{};
 }
 
-void VideoStream::performReset(QSize newSize)
+void VideoStream::performReset(QSize newSize, bool resetGraphics)
 {
     auto &surface = d->surface->surface;
     if (!d->gfxContext) {
@@ -1071,23 +1072,25 @@ void VideoStream::performReset(QSize newSize)
 
     destroySurface();
 
-    RDPGFX_RESET_GRAPHICS_PDU resetGraphicsPdu;
-    resetGraphicsPdu.width = newSize.width();
-    resetGraphicsPdu.height = newSize.height();
-    resetGraphicsPdu.monitorCount = 1;
+    if (resetGraphics) {
+        RDPGFX_RESET_GRAPHICS_PDU resetGraphicsPdu;
+        resetGraphicsPdu.width = newSize.width();
+        resetGraphicsPdu.height = newSize.height();
+        resetGraphicsPdu.monitorCount = 1;
 
-    MONITOR_DEF monitor = {};
-    monitor.left = 0;
-    monitor.right = newSize.width();
-    monitor.top = 0;
-    monitor.bottom = newSize.height();
-    monitor.flags = MONITOR_PRIMARY;
-    resetGraphicsPdu.monitorDefArray = &monitor;
-    qCDebug(KRDP) << "ResetGraphics" << newSize << "next surface" << d->nextSurfaceId << "frameId" << d->frameId;
-    UINT status = d->gfxContext->ResetGraphics(d->gfxContext.get(), &resetGraphicsPdu);
-    if (status != CHANNEL_RC_OK) {
-        qCWarning(KRDP) << "ResetGraphics failed" << status << "for size" << newSize;
-        return;
+        MONITOR_DEF monitor = {};
+        monitor.left = 0;
+        monitor.right = newSize.width();
+        monitor.top = 0;
+        monitor.bottom = newSize.height();
+        monitor.flags = MONITOR_PRIMARY;
+        resetGraphicsPdu.monitorDefArray = &monitor;
+        qCDebug(KRDP) << "ResetGraphics" << newSize << "next surface" << d->nextSurfaceId << "frameId" << d->frameId;
+        UINT status = d->gfxContext->ResetGraphics(d->gfxContext.get(), &resetGraphicsPdu);
+        if (status != CHANNEL_RC_OK) {
+            qCWarning(KRDP) << "ResetGraphics failed" << status << "for size" << newSize;
+            return;
+        }
     }
 
     RDPGFX_CREATE_SURFACE_PDU createSurfacePdu;
@@ -1096,7 +1099,8 @@ void VideoStream::performReset(QSize newSize)
     const uint16_t surfaceId = d->nextSurfaceId++;
     createSurfacePdu.surfaceId = surfaceId;
     createSurfacePdu.pixelFormat = GFX_PIXEL_FORMAT_XRGB_8888;
-    status = d->gfxContext->CreateSurface(d->gfxContext.get(), &createSurfacePdu);
+    qCDebug(KRDP) << "CreateSurface" << surfaceId << newSize;
+    UINT status = d->gfxContext->CreateSurface(d->gfxContext.get(), &createSurfacePdu);
     if (status != CHANNEL_RC_OK) {
         qCWarning(KRDP) << "CreateSurface failed" << status << "surface" << surfaceId << "size" << newSize;
         return;
@@ -1302,9 +1306,25 @@ void VideoStream::sendFrame(const VideoFrame &frame)
         }
     }
 
+    // touch $XDG_RUNTIME_DIR/krdp-reset-now gives the client a new surface of the same size,
+    // after a ResetGraphics, as a resize does. krdp-surface-now does the same without the
+    // ResetGraphics. A resize cleared the purple corruption on Windows clients where a new
+    // encoder with a full key frame on the old surface did not; these tell which part did it.
+    bool resetGraphics = true;
+    if (const auto now = clk::steady_clock::now(); now - d->resetChecked >= clk::milliseconds(500)) {
+        d->resetChecked = now;
+        static const QString runtimeDir = qEnvironmentVariable("XDG_RUNTIME_DIR");
+        for (const auto &[name, withReset] : {std::pair{QStringLiteral("/krdp-reset-now"), true}, std::pair{QStringLiteral("/krdp-surface-now"), false}}) {
+            if (QFile::exists(runtimeDir + name) && QFile::remove(runtimeDir + name)) {
+                qCWarning(KRDP) << "New surface on request" << (withReset ? "after ResetGraphics" : "without ResetGraphics");
+                d->surface->pendingReset = true;
+                resetGraphics = withReset;
+            }
+        }
+    }
     if (d->surface->pendingReset) {
         d->surface->pendingReset = false;
-        performReset(frame.size);
+        performReset(frame.size, resetGraphics);
     }
     if (d->surface->surface.size != frame.size) {
         performReset(frame.size);
