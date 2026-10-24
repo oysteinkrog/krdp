@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -623,9 +624,28 @@ void AudioStream::Private::clearBlockInfos()
     blockInfos.fill({});
 }
 
+// FreeRDP's FFmpeg Opus encoder uses FREERDP_OPUS_FRAME_MS (default 10 ms, set in our
+// FreeRDP fork). Feed it exactly one frame per call: a call with two frames writes two
+// packets into one wave PDU, and the client cannot split them.
+static int opusFrameMs()
+{
+    static const int ms = [] {
+        const char *env = getenv("FREERDP_OPUS_FRAME_MS");
+        const int v = env ? atoi(env) : 10;
+        return (v == 5 || v == 10 || v == 20 || v == 40 || v == 60) ? v : 10;
+    }();
+    return ms;
+}
+
 int AudioStream::Private::frameSamples() const
 {
-    return codec == Codec::Aac ? s_aacFrameSamples : int(sampleRate / 50);
+    if (codec == Codec::Aac) {
+        return s_aacFrameSamples;
+    }
+    if (codec == Codec::Opus) {
+        return int(sampleRate) * opusFrameMs() / 1000;
+    }
+    return int(sampleRate / 50);
 }
 
 QByteArray AudioStream::Private::encodeFrame(const uint8_t *pcm)
