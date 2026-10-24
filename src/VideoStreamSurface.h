@@ -67,6 +67,18 @@ public:
                               const VideoFrame &frame,
                               quint64 resetGeneration);
 
+    /// H.265 4:4:4 (RDPGFX_CODECID_HEVC444, a private extension of the oysteinkrog FreeRDP
+    /// fork) from a frame the GPU converted to one YUV 4:4:4 picture. encode(out) encodes it.
+    /// The parameters are as for sendFrameAvcGpu().
+    using HevcEncode = std::function<bool(QByteArray &out)>;
+    AvcResult sendFrameHevcGpu(RdpgfxServerContext *gfxContext,
+                               const HevcEncode &encode,
+                               quint64 encoderGeneration,
+                               quint32 qp,
+                               uint32_t frameId,
+                               const VideoFrame &frame,
+                               quint64 resetGeneration);
+
     /// Writes the next frames sent by sendFrameAvcGpu() to dir, for tools/avc444dumpdecode.
     /// The caller makes the first one a key frame.
     void startGpuDump(const QString &dir, std::chrono::seconds length);
@@ -90,6 +102,9 @@ public:
 
     // GPU conversion for AVC444, on the main thread in onFrameReceived().
     std::unique_ptr<GpuAvc444Converter> gpuConverter;
+    /// The client confirmed H.265 4:4:4, so the GPU converts frames to one YUV 4:4:4
+    /// picture for sendFrameHevcGpu() instead of the two AVC444v2 pictures.
+    std::atomic_bool hevc444 = false;
     std::atomic_bool gpuFailed = false; // set by the frame submission thread if encoding fails
     // Changed tiles of every converted frame, by sequence number. Each frame's tiles say what
     // changed since the frame before it, so a frame that is dropped before encoding must pass

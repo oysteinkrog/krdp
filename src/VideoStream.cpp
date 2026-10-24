@@ -116,6 +116,7 @@ struct RdpCapsInformation {
     bool avcSupported : 1 = false;
     bool yuv420Supported : 1 = false;
     bool avc444Supported : 1 = false;
+    bool hevc444Supported : 1 = false; ///< the private RDPGFX_CAPS_FLAG_HEVC444_SUPPORTED
     bool known : 1 = false; ///< a version FreeRDP and KRDP understand
 };
 
@@ -200,6 +201,7 @@ public:
     // The client needs a key frame on the GPU path; sendFrame() opens a new encoder.
     std::atomic_bool gpuKeyFrameNeeded = false;
     GpuH264Encoder::Speed gpuSpeed() const;
+    GpuH264Encoder::Codec gpuCodec() const;
     // Refresh key frames on the GPU path; only the frame submission thread touches these.
     quint64 gpuKeyFrameGeneration = 0; // encoder generation of the last key frame
     clk::steady_clock::time_point gpuLastKeyFrame{};
@@ -313,6 +315,8 @@ VideoEncoderSettings::fromStrings(const QString &codec, const QString &encoder, 
         settings.codec = Codec::Auto;
     } else if (is(codec, QLatin1StringView("AVC444"))) {
         settings.codec = Codec::AVC444;
+    } else if (is(codec, QLatin1StringView("HEVC444"))) {
+        settings.codec = Codec::HEVC444;
     } else if (is(codec, QLatin1StringView("AVC420"))) {
         settings.codec = Codec::AVC420;
     } else if (is(codec, QLatin1StringView("RemoteFX"))) {
@@ -361,7 +365,9 @@ bool VideoStream::h264Disabled()
 
 bool VideoStream::avc444Allowed()
 {
-    return !h264Disabled() && (s_encoderSettings.codec == VideoEncoderSettings::Codec::Auto || s_encoderSettings.codec == VideoEncoderSettings::Codec::AVC444);
+    return !h264Disabled()
+        && (s_encoderSettings.codec == VideoEncoderSettings::Codec::Auto || s_encoderSettings.codec == VideoEncoderSettings::Codec::AVC444
+            || s_encoderSettings.codec == VideoEncoderSettings::Codec::HEVC444);
 }
 
 GpuH264Encoder::Speed VideoStream::Private::gpuSpeed() const
@@ -375,6 +381,11 @@ GpuH264Encoder::Speed VideoStream::Private::gpuSpeed() const
         break;
     }
     return GpuH264Encoder::Speed::Fast;
+}
+
+GpuH264Encoder::Codec VideoStream::Private::gpuCodec() const
+{
+    return surface->hevc444 ? GpuH264Encoder::Codec::Hevc444 : GpuH264Encoder::Codec::H264;
 }
 
 bool VideoStream::Private::gpuRefreshDue(clk::steady_clock::time_point now) const
@@ -399,7 +410,7 @@ void VideoStream::Private::prepareGpuEncoder()
         lumaFrame = frameQueue.first().avc444->lumaFrame;
     }
     if (lumaFrame) {
-        gpuEncoder.ensure(lumaFrame.get(), h264TargetQp.load(), requestedFrameRate.load(), gpuSpeed());
+        gpuEncoder.ensure(lumaFrame.get(), h264TargetQp.load(), requestedFrameRate.load(), gpuSpeed(), gpuCodec());
     }
 }
 
@@ -813,6 +824,8 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
                 // A thin client asks for AVC420 only.
                 caps.avc444Supported = !(set.flags & RDPGFX_CAPS_FLAG_AVC_THINCLIENT);
             }
+            // Only the 10.7 set has room for the private flag (see rdpgfx.h in the fork).
+            caps.hevc444Supported = caps.version == RDPGFX_CAPVERSION_107 && caps.avcSupported && (set.flags & RDPGFX_CAPS_FLAG_HEVC444_SUPPORTED);
             break;
         case RDPGFX_CAPVERSION_81:
             caps.known = true;
@@ -827,7 +840,7 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         }
 
         qCDebug(KRDP) << " " << capVersionToString(caps.version) << Qt::hex << caps.version << "flags:" << Qt::hex << set.flags << Qt::dec << "AVC:" << caps.avcSupported
-                      << "YUV420:" << caps.yuv420Supported << "AVC444:" << caps.avc444Supported;
+                      << "YUV420:" << caps.yuv420Supported << "AVC444:" << caps.avc444Supported << "HEVC444:" << caps.hevc444Supported;
 
         capsInformation.push_back(caps);
     }
@@ -854,6 +867,7 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
             break;
         case VideoEncoderSettings::Codec::Auto:
         case VideoEncoderSettings::Codec::AVC444:
+        case VideoEncoderSettings::Codec::HEVC444:
             negotiatedMode = supportsAvc444 ? EncodingMode::AVC444 : EncodingMode::AVC420;
             break;
         case VideoEncoderSettings::Codec::AVC420:
@@ -868,9 +882,23 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         return CHANNEL_RC_INITIALIZATION_ERROR;
     }
 
+    // H.265 4:4:4 runs on the GPU AVC444 path only: NVENC from the converter's CUDA frames.
+    const auto &settings = encoderSettings();
+    const bool hevc444 = negotiatedMode == EncodingMode::AVC444 && maxVersion->hevc444Supported && settings.codec == VideoEncoderSettings::Codec::HEVC444
+        && settings.gpuEncode && settings.encoder != VideoEncoderSettings::Encoder::Libx264 && !d->surface->gpuFailed;
+    // Confirm the flag only when we send H.265; the client decodes it only then.
+    if (!hevc444 && maxVersion != capsInformation.end()) {
+        maxVersion->capSet.flags &= ~RDPGFX_CAPS_FLAG_HEVC444_SUPPORTED;
+    }
+
     QMetaObject::invokeMethod(
         this,
-        [this, negotiatedMode, readvertised]() {
+        [this, negotiatedMode, readvertised, hevc444]() {
+            if (d->surface->hevc444 != hevc444) {
+                // The converter's layout and the encoder change, so start the stream anew.
+                d->surface->hevc444 = hevc444;
+                d->activeEncodingMode.reset();
+            }
             if (readvertised) {
                 // The client dropped every frame it had, including the H.264 key frame.
                 // setActiveEncodingMode() skips an unchanged mode, so force a new encoder:
@@ -880,7 +908,7 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
             setActiveEncodingMode(negotiatedMode);
         },
         Qt::BlockingQueuedConnection); // RDP callbacks are on the connection thread, VideoStream operates on the main thread
-    qCDebug(KRDP) << "Selected encoding mode:" << encodingModeName(negotiatedMode);
+    qCDebug(KRDP) << "Selected encoding mode:" << encodingModeName(negotiatedMode) << (hevc444 ? "as H.265 4:4:4" : "");
 
     qCDebug(KRDP) << "Selected caps:" << capVersionToString(maxVersion->version);
 
@@ -1350,7 +1378,7 @@ void VideoStream::sendFrame(const VideoFrame &frame)
             VideoStreamSurface::AvcResult result = VideoStreamSurface::AvcResult::Failed;
             if (avc444 && frame.avc444 && frame.avc444->lumaFrame) {
                 const quint32 qp = d->h264TargetQp.load();
-                if (d->gpuEncoder.ensure(frame.avc444->lumaFrame.get(), qp, d->requestedFrameRate.load(), d->gpuSpeed())) {
+                if (d->gpuEncoder.ensure(frame.avc444->lumaFrame.get(), qp, d->requestedFrameRate.load(), d->gpuSpeed(), d->gpuCodec())) {
                     const auto now = clk::steady_clock::now();
                     // touch $XDG_RUNTIME_DIR/krdp-dump-now captures the next 10 s of the stream,
                     // starting with a key frame, to /var/tmp/krdp-dump.
@@ -1370,7 +1398,7 @@ void VideoStream::sendFrame(const VideoFrame &frame)
                         // second, and then dropped the connection. The first picture of a new
                         // encoder it always takes. Opening one costs about 100 ms.
                         d->gpuEncoder.close();
-                        d->gpuEncoder.ensure(frame.avc444->lumaFrame.get(), qp, d->requestedFrameRate.load(), d->gpuSpeed());
+                        d->gpuEncoder.ensure(frame.avc444->lumaFrame.get(), qp, d->requestedFrameRate.load(), d->gpuSpeed(), d->gpuCodec());
                     } else if (d->gpuRefreshDue(now)) {
                         d->gpuEncoder.requestKeyFrame();
                     }
@@ -1381,16 +1409,29 @@ void VideoStream::sendFrame(const VideoFrame &frame)
                         d->gpuLastKeyFrame = now;
                     }
                     const auto &picture = *frame.avc444;
-                    result = d->surface->sendFrameAvcGpu(
-                        d->gfxContext.get(),
-                        [this, &picture](bool chroma, QByteArray &out) {
-                            return d->gpuEncoder.encode(chroma ? picture.chromaFrame.get() : picture.lumaFrame.get(), out);
-                        },
-                        d->gpuEncoder.generation(),
-                        qp,
-                        frameId,
-                        frame,
-                        resetGeneration);
+                    if (picture.yuv444) {
+                        result = d->surface->sendFrameHevcGpu(
+                            d->gfxContext.get(),
+                            [this, &picture](QByteArray &out) {
+                                return d->gpuEncoder.encode(picture.lumaFrame.get(), out);
+                            },
+                            d->gpuEncoder.generation(),
+                            qp,
+                            frameId,
+                            frame,
+                            resetGeneration);
+                    } else {
+                        result = d->surface->sendFrameAvcGpu(
+                            d->gfxContext.get(),
+                            [this, &picture](bool chroma, QByteArray &out) {
+                                return d->gpuEncoder.encode(chroma ? picture.chromaFrame.get() : picture.lumaFrame.get(), out);
+                            },
+                            d->gpuEncoder.generation(),
+                            qp,
+                            frameId,
+                            frame,
+                            resetGeneration);
+                    }
                     if (result == VideoStreamSurface::AvcResult::Sent) {
                         d->gpuLastFrame = frame;
                         d->gpuLastSent = now;

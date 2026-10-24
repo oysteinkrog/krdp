@@ -31,12 +31,17 @@ public:
         Fastest, ///< p1
     };
 
+    enum class Codec {
+        H264, ///< h264_nvenc, for AVC444v2 and AVC420
+        Hevc444, ///< hevc_nvenc Main 4:4:4 (Rext), for RDPGFX_CODECID_HEVC444; needs YUV444P frames
+    };
+
     GpuH264Encoder();
     ~GpuH264Encoder();
 
     /// Opens a new encoder if none is open or any parameter changed. The frames must come
     /// from one CUDA frames context, which the encoder takes from the first frame.
-    bool ensure(const AVFrame *frame, quint32 qp, int frameRate, Speed speed);
+    bool ensure(const AVFrame *frame, quint32 qp, int frameRate, Speed speed, Codec codec = Codec::H264);
 
     /// Makes the next picture an IDR picture with SPS and PPS, for a client that dropped its
     /// decoder. Much faster than opening a new encoder (about 100 ms). Counts as a new generation.
@@ -56,6 +61,7 @@ private:
     quint32 m_qp = 0;
     int m_frameRate = 0;
     Speed m_speed = Speed::Fast;
+    Codec m_codec = Codec::H264;
     quint64 m_generation = 0;
     qint64 m_pts = 0;
     bool m_keyFrameRequested = false;

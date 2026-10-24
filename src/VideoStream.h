@@ -33,6 +33,10 @@ struct KRDP_EXPORT VideoEncoderSettings {
         KPipeWire, ///< H.264 4:2:0 from the KPipeWire encoder (the original path)
         Auto, ///< AVC444 if the client supports it, else AVC420, else RemoteFX
         AVC444, ///< H.264 4:4:4 (AVC444v2) from FreeRDP, falling back like Auto
+        /// H.265 4:4:4 from NVENC (RDPGFX_CODECID_HEVC444) for clients built from the
+        /// oysteinkrog FreeRDP fork that ask for it; other clients get AVC444 as above.
+        /// Needs the GPU path.
+        HEVC444,
         AVC420, ///< H.264 4:2:0 from FreeRDP, else RemoteFX
         RemoteFX, ///< RemoteFX Progressive, no H.264
     };

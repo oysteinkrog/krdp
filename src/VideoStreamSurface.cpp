@@ -324,7 +324,10 @@ void VideoStreamSurface::onFrameReceived(const PipeWireFrame &data)
         if (!gpuConverter->cudaAvailable()) {
             qCWarning(KRDP) << "GPU encode: CUDA is not available; using the CPU path";
             gpuFailed = true;
-        } else if (gpuConverter->convert(data, *picture, GpuAvc444Converter::Output::Cuda)) {
+        } else if (gpuConverter->convert(data,
+                                         *picture,
+                                         GpuAvc444Converter::Output::Cuda,
+                                         hevc444 ? GpuAvc444Converter::Layout::Yuv444 : GpuAvc444Converter::Layout::Avc444v2)) {
             ++gpuConvertedFrames;
             frameData.gpuSequence = ++gpuSequence;
             {
@@ -659,6 +662,127 @@ static QByteArray checkAvcPicture(const std::vector<RECTANGLE_16> &rects, const 
     return out.trimmed();
 }
 
+// One picture with its metablock, as [MS-RDPEGFX] 2.2.4.4 RDPGFX_AVC420_BITMAP_STREAM. The
+// stream points into data. Release the metablock with free_h264_metablock().
+static RDPGFX_AVC420_BITMAP_STREAM makeAvc420Stream(const std::vector<RECTANGLE_16> &rects, QByteArray &data, quint32 qp)
+{
+    RDPGFX_AVC420_BITMAP_STREAM stream = {};
+    stream.data = reinterpret_cast<BYTE *>(data.data());
+    stream.length = UINT32(data.size());
+    stream.meta.numRegionRects = UINT32(rects.size());
+    // free_h264_metablock() releases these with free().
+    stream.meta.regionRects = static_cast<RECTANGLE_16 *>(calloc(rects.size(), sizeof(RECTANGLE_16)));
+    stream.meta.quantQualityVals = static_cast<RDPGFX_H264_QUANT_QUALITY *>(calloc(rects.size(), sizeof(RDPGFX_H264_QUANT_QUALITY)));
+    for (size_t i = 0; i < rects.size() && stream.meta.regionRects && stream.meta.quantQualityVals; ++i) {
+        stream.meta.regionRects[i] = rects[i];
+        // As FreeRDP's allocate_h264_metablock(): bits 6 and 7 of qp are flags.
+        stream.meta.quantQualityVals[i].qp = UINT8(qp & 0x3F);
+        stream.meta.quantQualityVals[i].qualityVal = UINT8(100 - (qp & 0x3F));
+    }
+    return stream;
+}
+
+// The changed 64x64 tiles as rectangles, joining runs of tiles within a row, or the whole
+// surface.
+static std::vector<RECTANGLE_16> changedTileRects(const std::vector<uint8_t> &tiles, int tilesPerRow, int width, int height, uint8_t bit, bool everything)
+{
+    std::vector<RECTANGLE_16> rects;
+    if (everything) {
+        rects.push_back({0, 0, UINT16(width), UINT16(height)});
+        return rects;
+    }
+    const int tileRows = (height + 63) / 64;
+    for (int ty = 0; ty < tileRows; ++ty) {
+        const uint8_t *row = tiles.data() + size_t(ty) * tilesPerRow;
+        for (int tx = 0; tx < tilesPerRow;) {
+            if (!(row[tx] & bit)) {
+                ++tx;
+                continue;
+            }
+            const int start = tx;
+            while (tx < tilesPerRow && (row[tx] & bit)) {
+                ++tx;
+            }
+            rects.push_back({UINT16(start * 64), UINT16(ty * 64), UINT16(std::min(tx * 64, width)), UINT16(std::min((ty + 1) * 64, height))});
+        }
+    }
+    return rects;
+}
+
+VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameHevcGpu(RdpgfxServerContext *gfxContext,
+                                                                   const HevcEncode &encode,
+                                                                   quint64 encoderGeneration,
+                                                                   quint32 qp,
+                                                                   uint32_t frameId,
+                                                                   const VideoFrame &frame,
+                                                                   quint64 resetGeneration)
+{
+    const GpuAvc444Picture &picture = *frame.avc444;
+    if (surface.id == 0) {
+        qCWarning(KRDP) << "No graphics surface available for H.265 frame submission";
+        return AvcResult::Unchanged;
+    }
+    if (encoderGeneration != gpuEncoderGeneration) {
+        // A new encoder starts with a key frame, which the client must get in full.
+        gpuEncoderGeneration = encoderGeneration;
+        gpuLumaSent = false;
+    }
+
+    const int width = picture.size.width();
+    const int height = picture.size.height();
+    std::vector<uint8_t> tiles;
+    const bool complete = takeGpuChanges(frame.gpuSequence, tiles) && tiles.size() == size_t(picture.tilesPerRow) * ((height + 63) / 64);
+    const auto rects = changedTileRects(tiles, picture.tilesPerRow, width, height, GpuAvc444Picture::LumaChanged, !complete || !gpuLumaSent);
+    if (rects.empty()) {
+        return AvcResult::Unchanged;
+    }
+
+    // The whole picture is encoded; the rects only tell the client which areas to convert
+    // to RGB and draw.
+    QByteArray data;
+    if (!encode(data)) {
+        qCWarning(KRDP) << "GPU H.265 4:4:4: encoding failed";
+        return AvcResult::Failed;
+    }
+    RDPGFX_AVC420_BITMAP_STREAM stream = makeAvc420Stream(rects, data, qp);
+    const auto freeMetablock = qScopeGuard([&]() {
+        free_h264_metablock(&stream.meta);
+    });
+    if (!stream.meta.regionRects || !stream.meta.quantQualityVals) {
+        return AvcResult::Failed;
+    }
+
+    RDPGFX_START_FRAME_PDU startFramePdu = {};
+    RDPGFX_END_FRAME_PDU endFramePdu = {};
+    const auto now = QDateTime::currentDateTimeUtc().time();
+    startFramePdu.timestamp = now.hour() << 22 | now.minute() << 16 | now.second() << 10 | now.msec();
+    startFramePdu.frameId = frameId;
+    endFramePdu.frameId = frameId;
+
+    RDPGFX_SURFACE_COMMAND surfaceCommand = {};
+    surfaceCommand.surfaceId = surface.id;
+    surfaceCommand.contextId = 0;
+    surfaceCommand.format = PIXEL_FORMAT_BGRX32;
+    surfaceCommand.right = UINT32(width);
+    surfaceCommand.bottom = UINT32(height);
+    surfaceCommand.width = UINT32(width);
+    surfaceCommand.height = UINT32(height);
+    surfaceCommand.codecId = RDPGFX_CODECID_HEVC444;
+    surfaceCommand.extra = &stream;
+
+    if (this->resetGeneration != resetGeneration) {
+        qCDebug(KRDP) << "Client reset its graphics while frame" << frameId << "was encoded; dropping it";
+        return AvcResult::Stale;
+    }
+    const UINT status = gfxContext->SurfaceFrameCommand(gfxContext, &surfaceCommand, &startFramePdu, &endFramePdu);
+    if (status != CHANNEL_RC_OK) {
+        qCWarning(KRDP) << "SurfaceFrameCommand failed" << status << "frameId" << frameId << "surface" << surfaceCommand.surfaceId << "GPU H.265 4:4:4";
+    }
+    lastFrameBytes = quint32(data.size());
+    gpuLumaSent = true;
+    return AvcResult::Sent;
+}
+
 VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerContext *gfxContext,
                                                                   const AvcEncode &encode,
                                                                   quint64 encoderGeneration,
@@ -685,28 +809,8 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
     std::vector<uint8_t> tiles;
     const bool complete = takeGpuChanges(frame.gpuSequence, tiles) && tiles.size() == size_t(picture.tilesPerRow) * tileRows;
 
-    // Changed tiles as rectangles, joining runs of tiles within a row.
     const auto changedRects = [&](uint8_t bit, bool everything) {
-        std::vector<RECTANGLE_16> rects;
-        if (everything) {
-            rects.push_back({0, 0, UINT16(width), UINT16(height)});
-            return rects;
-        }
-        for (int ty = 0; ty < tileRows; ++ty) {
-            const uint8_t *row = tiles.data() + size_t(ty) * picture.tilesPerRow;
-            for (int tx = 0; tx < picture.tilesPerRow;) {
-                if (!(row[tx] & bit)) {
-                    ++tx;
-                    continue;
-                }
-                const int start = tx;
-                while (tx < picture.tilesPerRow && (row[tx] & bit)) {
-                    ++tx;
-                }
-                rects.push_back({UINT16(start * 64), UINT16(ty * 64), UINT16(std::min(tx * 64, width)), UINT16(std::min((ty + 1) * 64, height))});
-            }
-        }
-        return rects;
+        return changedTileRects(tiles, picture.tilesPerRow, width, height, bit, everything);
     };
     auto lumaRects = changedRects(GpuAvc444Picture::LumaChanged, !complete || !gpuLumaSent);
     auto chromaRects = changedRects(GpuAvc444Picture::ChromaChanged, !complete || !gpuChromaSent);
@@ -743,20 +847,7 @@ VideoStreamSurface::AvcResult VideoStreamSurface::sendFrameAvcGpu(RdpgfxServerCo
     }
 
     const auto makeStream = [qp](const std::vector<RECTANGLE_16> &rects, QByteArray &data) {
-        RDPGFX_AVC420_BITMAP_STREAM stream = {};
-        stream.data = reinterpret_cast<BYTE *>(data.data());
-        stream.length = UINT32(data.size());
-        stream.meta.numRegionRects = UINT32(rects.size());
-        // free_h264_metablock() releases these with free().
-        stream.meta.regionRects = static_cast<RECTANGLE_16 *>(calloc(rects.size(), sizeof(RECTANGLE_16)));
-        stream.meta.quantQualityVals = static_cast<RDPGFX_H264_QUANT_QUALITY *>(calloc(rects.size(), sizeof(RDPGFX_H264_QUANT_QUALITY)));
-        for (size_t i = 0; i < rects.size() && stream.meta.regionRects && stream.meta.quantQualityVals; ++i) {
-            stream.meta.regionRects[i] = rects[i];
-            // As FreeRDP's allocate_h264_metablock(): bits 6 and 7 of qp are flags.
-            stream.meta.quantQualityVals[i].qp = UINT8(qp & 0x3F);
-            stream.meta.quantQualityVals[i].qualityVal = UINT8(100 - (qp & 0x3F));
-        }
-        return stream;
+        return makeAvc420Stream(rects, data, qp);
     };
 
     RDPGFX_AVC444_BITMAP_STREAM avc444Stream = {};

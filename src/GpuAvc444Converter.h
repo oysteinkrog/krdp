@@ -31,8 +31,12 @@ struct GpuAvc444Picture {
     std::vector<uint8_t> tiles;
     int tilesPerRow = 0;
     /// With Output::Cuda: the two pictures as FFmpeg CUDA frames (YUV420P), ready for NVENC.
+    /// With Layout::Yuv444, lumaFrame is the one YUV444P picture and chromaFrame is empty.
     std::shared_ptr<AVFrame> lumaFrame;
     std::shared_ptr<AVFrame> chromaFrame;
+    /// Converted with Layout::Yuv444: luma holds full Y, U and V planes of width x height
+    /// bytes each, chroma is empty, and only LumaChanged is set in tiles.
+    bool yuv444 = false;
 
     static constexpr uint8_t LumaChanged = 1;
     static constexpr uint8_t ChromaChanged = 2;
@@ -61,9 +65,14 @@ public:
         TilesOnly, ///< only the changed tiles, for timing tests
     };
 
+    enum class Layout {
+        Avc444v2, ///< the two YUV 4:2:0 pictures of AVC444v2
+        Yuv444, ///< one YUV 4:4:4 picture, for H.265 4:4:4 (RDPGFX_CODECID_HEVC444)
+    };
+
     /// Converts the frame. Returns false if the GPU path is not available or failed, in
     /// which case the caller should use the CPU path.
-    bool convert(const PipeWireFrame &frame, GpuAvc444Picture &picture, Output output = Output::Cpu);
+    bool convert(const PipeWireFrame &frame, GpuAvc444Picture &picture, Output output = Output::Cpu, Layout layout = Layout::Avc444v2);
 
     /// Whether Output::Cuda works: libcuda is there and can share buffers with the GL context.
     bool cudaAvailable();

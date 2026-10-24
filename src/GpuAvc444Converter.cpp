@@ -143,6 +143,89 @@ void main()
 }
 )";
 
+// One YUV 4:4:4 picture for H.265 4:4:4: full Y, U and V planes, with the same integer
+// formulas as above. The client converts back with FreeRDP's YUV444ToRGB_8u_P3AC4R, the
+// inverse AVC444 uses, so both codecs show the same colours.
+constexpr const char *Yuv444ShaderSource = R"(#version 430
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D source;
+layout(std430, binding = 1) writeonly buffer PictureOut { uint pictureOut[]; };
+layout(std430, binding = 3) readonly buffer PicturePrev { uint picturePrev[]; };
+layout(std430, binding = 5) buffer Tiles { uint tiles[]; };
+
+uniform ivec2 size;
+uniform int tilesPerRow;
+
+bool changed = false;
+
+void put(int byteOffset, uint word)
+{
+    const int i = byteOffset / 4;
+    pictureOut[i] = word;
+    changed = changed || picturePrev[i] != word;
+}
+
+void main()
+{
+    const int x0 = int(gl_GlobalInvocationID.x) * 16;
+    const int y = int(gl_GlobalInvocationID.y) * 2;
+    if (x0 >= size.x || y >= size.y) {
+        return;
+    }
+    const int planeSize = size.x * size.y;
+    for (int r = 0; r < 2; ++r) {
+        for (int w = 0; w < 4; ++w) {
+            uint Y = 0u;
+            uint U = 0u;
+            uint V = 0u;
+            for (int c = 0; c < 4; ++c) {
+                const ivec3 rgb = ivec3(round(texelFetch(source, ivec2(x0 + 4 * w + c, y + r), 0).rgb * 255.0));
+                Y |= uint((54 * rgb.r + 183 * rgb.g + 18 * rgb.b) >> 8) << (8 * c);
+                U |= uint(((-29 * rgb.r - 99 * rgb.g + 128 * rgb.b) >> 8) + 128) << (8 * c);
+                V |= uint(((128 * rgb.r - 116 * rgb.g - 12 * rgb.b) >> 8) + 128) << (8 * c);
+            }
+            const int offset = (y + r) * size.x + x0 + 4 * w;
+            put(offset, Y);
+            put(planeSize + offset, U);
+            put(2 * planeSize + offset, V);
+        }
+    }
+    if (changed) {
+        atomicOr(tiles[(y / 64) * tilesPerRow + x0 / 64], 1u);
+    }
+}
+)";
+
+GLuint buildProgram(const char *source)
+{
+    const GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    GLint ok = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[4096] = {};
+        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+        qCWarning(KRDP) << "GPU AVC444: shader does not compile:" << log;
+        glDeleteShader(shader);
+        return 0;
+    }
+    const GLuint program = glCreateProgram();
+    glAttachShader(program, shader);
+    glLinkProgram(program);
+    glDeleteShader(shader);
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[4096] = {};
+        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+        qCWarning(KRDP) << "GPU AVC444: shader does not link:" << log;
+        glDeleteProgram(program);
+        return 0;
+    }
+    return program;
+}
+
 QByteArray eglErrorString()
 {
     return QByteArray::number(eglGetError(), 16);
@@ -154,11 +237,11 @@ class GpuAvc444Converter::Private
 public:
     ~Private();
     bool initialize();
-    bool ensureBuffers(const QSize &size);
+    bool ensureBuffers(const QSize &size, Layout layout);
     bool initializeCuda();
-    bool ensureCudaFrames(const QSize &size);
+    bool ensureCudaFrames(const QSize &size, AVPixelFormat format);
     void unregisterCudaBuffers();
-    bool copyToCuda(int index, const QSize &size, GpuAvc444Picture &picture);
+    bool copyToCuda(int index, const QSize &size, Layout layout, GpuAvc444Picture &picture);
     GLuint importTexture(const DmaBufAttributes &dmabuf, EGLImage *image);
 
     bool initialized = false;
@@ -168,11 +251,15 @@ public:
     gbm_device *gbm = nullptr;
     EGLDisplay display = EGL_NO_DISPLAY;
     EGLContext context = EGL_NO_CONTEXT;
-    GLuint program = 0;
-    GLint sizeUniform = -1;
-    GLint tilesPerRowUniform = -1;
+    struct Program {
+        GLuint id = 0;
+        GLint sizeUniform = -1;
+        GLint tilesPerRowUniform = -1;
+    };
+    Program programs[2]; ///< by Layout
 
     QSize bufferSize;
+    Layout bufferLayout = Layout::Avc444v2;
     GLuint lumaBuffers[2] = {};
     GLuint chromaBuffers[2] = {};
     GLuint tileBuffer = 0;
@@ -187,6 +274,7 @@ public:
     AVBufferRef *hwDevice = nullptr;
     AVBufferRef *hwFrames = nullptr;
     QSize hwFramesSize;
+    AVPixelFormat hwFramesFormat = AV_PIX_FMT_NONE;
     CUgraphicsResource cudaLuma[2] = {};
     CUgraphicsResource cudaChroma[2] = {};
 };
@@ -201,7 +289,9 @@ GpuAvc444Converter::Private::~Private()
         glDeleteBuffers(2, lumaBuffers);
         glDeleteBuffers(2, chromaBuffers);
         glDeleteBuffers(1, &tileBuffer);
-        glDeleteProgram(program);
+        for (const auto &program : programs) {
+            glDeleteProgram(program.id);
+        }
         eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroyContext(display, context);
     }
@@ -255,9 +345,9 @@ bool GpuAvc444Converter::Private::initializeCuda()
     return true;
 }
 
-bool GpuAvc444Converter::Private::ensureCudaFrames(const QSize &size)
+bool GpuAvc444Converter::Private::ensureCudaFrames(const QSize &size, AVPixelFormat format)
 {
-    if (hwFrames && hwFramesSize == size) {
+    if (hwFrames && hwFramesSize == size && hwFramesFormat == format) {
         return true;
     }
     av_buffer_unref(&hwFrames);
@@ -267,7 +357,7 @@ bool GpuAvc444Converter::Private::ensureCudaFrames(const QSize &size)
     }
     auto *framesContext = reinterpret_cast<AVHWFramesContext *>(hwFrames->data);
     framesContext->format = AV_PIX_FMT_CUDA;
-    framesContext->sw_format = AV_PIX_FMT_YUV420P;
+    framesContext->sw_format = format;
     framesContext->width = size.width();
     framesContext->height = size.height();
     if (av_hwframe_ctx_init(hwFrames) < 0) {
@@ -276,6 +366,7 @@ bool GpuAvc444Converter::Private::ensureCudaFrames(const QSize &size)
         return false;
     }
     hwFramesSize = size;
+    hwFramesFormat = format;
     return true;
 }
 
@@ -297,9 +388,10 @@ void GpuAvc444Converter::Private::unregisterCudaBuffers()
     cuda->ctxPopCurrent(&popped);
 }
 
-bool GpuAvc444Converter::Private::copyToCuda(int index, const QSize &size, GpuAvc444Picture &picture)
+bool GpuAvc444Converter::Private::copyToCuda(int index, const QSize &size, Layout layout, GpuAvc444Picture &picture)
 {
-    if (!ensureCudaFrames(size)) {
+    const bool yuv444 = layout == Layout::Yuv444;
+    if (!ensureCudaFrames(size, yuv444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P)) {
         return false;
     }
     cuda->ctxPushCurrent(cudaContext);
@@ -318,19 +410,25 @@ bool GpuAvc444Converter::Private::copyToCuda(int index, const QSize &size, GpuAv
     }
 
     CUgraphicsResource resources[2] = {cudaLuma[index], cudaChroma[index]};
+    // The 4:4:4 picture is all in the luma buffer.
+    const unsigned int pictures = yuv444 ? 1 : 2;
     // Mapping waits for the GL work that wrote the buffers.
-    if (const CUresult r = cuda->graphicsMapResources(2, resources, nullptr); r != CUDA_SUCCESS) {
+    if (const CUresult r = cuda->graphicsMapResources(pictures, resources, nullptr); r != CUDA_SUCCESS) {
         qCWarning(KRDP) << "GPU encode: cannot map the buffers" << cuda->errorName(r);
         return false;
     }
     auto unmap = qScopeGuard([&]() {
-        cuda->graphicsUnmapResources(2, resources, nullptr);
+        cuda->graphicsUnmapResources(pictures, resources, nullptr);
     });
 
     const int w = size.width();
     const int h = size.height();
+    // Chroma planes are full size for 4:4:4 and a quarter for 4:2:0.
+    const size_t cw = yuv444 ? size_t(w) : size_t(w / 2);
+    const size_t ch = yuv444 ? size_t(h) : size_t(h / 2);
     std::shared_ptr<AVFrame> *targets[2] = {&picture.lumaFrame, &picture.chromaFrame};
-    for (int p = 0; p < 2; ++p) {
+    picture.chromaFrame.reset();
+    for (unsigned int p = 0; p < pictures; ++p) {
         CUdeviceptr source = 0;
         size_t sourceSize = 0;
         if (cuda->graphicsResourceGetMappedPointer(&source, &sourceSize, resources[p]) != CUDA_SUCCESS) {
@@ -345,9 +443,9 @@ bool GpuAvc444Converter::Private::copyToCuda(int index, const QSize &size, GpuAv
         *targets[p] = std::shared_ptr<AVFrame>(frame, [](AVFrame *f) {
             av_frame_free(&f);
         });
-        const size_t planeOffset[3] = {0, size_t(w) * h, size_t(w) * h + size_t(w / 2) * (h / 2)};
-        const size_t planeWidth[3] = {size_t(w), size_t(w / 2), size_t(w / 2)};
-        const size_t planeHeight[3] = {size_t(h), size_t(h / 2), size_t(h / 2)};
+        const size_t planeOffset[3] = {0, size_t(w) * h, size_t(w) * h + cw * ch};
+        const size_t planeWidth[3] = {size_t(w), cw, cw};
+        const size_t planeHeight[3] = {size_t(h), ch, ch};
         for (int plane = 0; plane < 3; ++plane) {
             CUDA_MEMCPY2D copy = {};
             copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
@@ -425,31 +523,15 @@ bool GpuAvc444Converter::Private::initialize()
         return false;
     }
 
-    const GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
-    glShaderSource(shader, 1, &ShaderSource, nullptr);
-    glCompileShader(shader);
-    GLint ok = GL_FALSE;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[4096] = {};
-        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
-        qCWarning(KRDP) << "GPU AVC444: shader does not compile:" << log;
-        glDeleteShader(shader);
-        return false;
+    const char *sources[2] = {ShaderSource, Yuv444ShaderSource};
+    for (int i = 0; i < 2; ++i) {
+        programs[i].id = buildProgram(sources[i]);
+        if (!programs[i].id) {
+            return false;
+        }
+        programs[i].sizeUniform = glGetUniformLocation(programs[i].id, "size");
+        programs[i].tilesPerRowUniform = glGetUniformLocation(programs[i].id, "tilesPerRow");
     }
-    program = glCreateProgram();
-    glAttachShader(program, shader);
-    glLinkProgram(program);
-    glDeleteShader(shader);
-    glGetProgramiv(program, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[4096] = {};
-        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
-        qCWarning(KRDP) << "GPU AVC444: shader does not link:" << log;
-        return false;
-    }
-    sizeUniform = glGetUniformLocation(program, "size");
-    tilesPerRowUniform = glGetUniformLocation(program, "tilesPerRow");
 
     qCDebug(KRDP) << "GPU AVC444: ready on" << node << reinterpret_cast<const char *>(glGetString(GL_RENDERER));
     failed = false;
@@ -457,9 +539,9 @@ bool GpuAvc444Converter::Private::initialize()
     return true;
 }
 
-bool GpuAvc444Converter::Private::ensureBuffers(const QSize &size)
+bool GpuAvc444Converter::Private::ensureBuffers(const QSize &size, Layout layout)
 {
-    if (size == bufferSize) {
+    if (size == bufferSize && layout == bufferLayout) {
         return true;
     }
     unregisterCudaBuffers();
@@ -467,7 +549,8 @@ bool GpuAvc444Converter::Private::ensureBuffers(const QSize &size)
     glDeleteBuffers(2, chromaBuffers);
     glDeleteBuffers(1, &tileBuffer);
 
-    const GLsizeiptr pictureSize = GLsizeiptr(size.width()) * size.height() * 3 / 2;
+    const GLsizeiptr pixels = GLsizeiptr(size.width()) * size.height();
+    const GLsizeiptr pictureSize = layout == Layout::Yuv444 ? pixels * 3 : pixels * 3 / 2;
     const GLsizeiptr tileCount = GLsizeiptr((size.width() + TileSize - 1) / TileSize) * ((size.height() + TileSize - 1) / TileSize);
     glCreateBuffers(2, lumaBuffers);
     glCreateBuffers(2, chromaBuffers);
@@ -483,6 +566,7 @@ bool GpuAvc444Converter::Private::ensureBuffers(const QSize &size)
         return false;
     }
     bufferSize = size;
+    bufferLayout = layout;
     havePrevious = false;
     return true;
 }
@@ -544,7 +628,7 @@ void GpuAvc444Converter::reset()
     d->havePrevious = false;
 }
 
-bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &picture, Output output)
+bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &picture, Output output, Layout layout)
 {
     if (!frame.dmabuf || frame.dmabuf->planes.isEmpty()) {
         return false;
@@ -557,7 +641,7 @@ bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &p
         qCWarning(KRDP) << "GPU AVC444: cannot make the context current" << eglErrorString();
         return false;
     }
-    if (!d->ensureBuffers(size)) {
+    if (!d->ensureBuffers(size, layout)) {
         return false;
     }
 
@@ -574,9 +658,11 @@ bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &p
 
     const int cur = d->current;
     const int prev = 1 - cur;
-    glUseProgram(d->program);
-    glUniform2i(d->sizeUniform, size.width(), size.height());
-    glUniform1i(d->tilesPerRowUniform, tilesPerRow);
+    const bool yuv444 = layout == Layout::Yuv444;
+    const auto &program = d->programs[yuv444 ? 1 : 0];
+    glUseProgram(program.id);
+    glUniform2i(program.sizeUniform, size.width(), size.height());
+    glUniform1i(program.tilesPerRowUniform, tilesPerRow);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, texture);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, d->lumaBuffers[cur]);
@@ -591,17 +677,21 @@ bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &p
 
     // Reading back waits for the shader, so the DMA-BUF is no longer used when this returns
     // and KPipeWire can hand it back to KWin.
-    const qsizetype pictureSize = qsizetype(size.width()) * size.height() * 3 / 2;
+    const qsizetype pictureSize = yuv444 ? qsizetype(size.width()) * size.height() * 3 : qsizetype(size.width()) * size.height() * 3 / 2;
     std::vector<GLuint> tileWords(size_t(tilesPerRow) * tileRows);
     glGetNamedBufferSubData(d->tileBuffer, 0, GLsizeiptr(tileWords.size() * sizeof(GLuint)), tileWords.data());
     bool copied = true;
     if (output == Output::Cuda) {
-        copied = d->copyToCuda(cur, size, picture);
+        copied = d->copyToCuda(cur, size, layout, picture);
     } else if (output == Output::Cpu) {
         picture.luma.resize(pictureSize);
-        picture.chroma.resize(pictureSize);
         glGetNamedBufferSubData(d->lumaBuffers[cur], 0, pictureSize, picture.luma.data());
-        glGetNamedBufferSubData(d->chromaBuffers[cur], 0, pictureSize, picture.chroma.data());
+        if (yuv444) {
+            picture.chroma.clear();
+        } else {
+            picture.chroma.resize(pictureSize);
+            glGetNamedBufferSubData(d->chromaBuffers[cur], 0, pictureSize, picture.chroma.data());
+        }
     }
 
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -617,10 +707,12 @@ bool GpuAvc444Converter::convert(const PipeWireFrame &frame, GpuAvc444Picture &p
     }
 
     picture.size = size;
+    picture.yuv444 = yuv444;
     picture.tilesPerRow = tilesPerRow;
     picture.tiles.resize(tileWords.size());
     for (size_t i = 0; i < tileWords.size(); ++i) {
-        picture.tiles[i] = d->havePrevious ? uint8_t(tileWords[i]) : uint8_t(GpuAvc444Picture::LumaChanged | GpuAvc444Picture::ChromaChanged);
+        const uint8_t all = yuv444 ? GpuAvc444Picture::LumaChanged : uint8_t(GpuAvc444Picture::LumaChanged | GpuAvc444Picture::ChromaChanged);
+        picture.tiles[i] = d->havePrevious ? uint8_t(tileWords[i]) : all;
     }
     d->havePrevious = true;
     d->current = prev;

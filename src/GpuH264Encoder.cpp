@@ -42,23 +42,24 @@ quint64 GpuH264Encoder::generation() const
     return m_generation;
 }
 
-bool GpuH264Encoder::ensure(const AVFrame *frame, quint32 qp, int frameRate, Speed speed)
+bool GpuH264Encoder::ensure(const AVFrame *frame, quint32 qp, int frameRate, Speed speed, Codec codec)
 {
     if (!frame || !frame->hw_frames_ctx) {
         return false;
     }
     const QSize size(frame->width, frame->height);
-    if (m_context && m_size == size && m_qp == qp && m_frameRate == frameRate && m_speed == speed) {
+    if (m_context && m_size == size && m_qp == qp && m_frameRate == frameRate && m_speed == speed && m_codec == codec) {
         return true;
     }
     close();
 
-    const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
-    if (!codec) {
-        qCWarning(KRDP) << "GPU encode: FFmpeg has no h264_nvenc";
+    const char *encoderName = codec == Codec::Hevc444 ? "hevc_nvenc" : "h264_nvenc";
+    const AVCodec *encoder = avcodec_find_encoder_by_name(encoderName);
+    if (!encoder) {
+        qCWarning(KRDP) << "GPU encode: FFmpeg has no" << encoderName;
         return false;
     }
-    m_context = avcodec_alloc_context3(codec);
+    m_context = avcodec_alloc_context3(encoder);
     m_packet = av_packet_alloc();
     if (!m_context || !m_packet) {
         close();
@@ -89,11 +90,15 @@ bool GpuH264Encoder::ensure(const AVFrame *frame, quint32 qp, int frameRate, Spe
     av_opt_set_int(m_context->priv_data, "qp", qp, 0);
     // A requested key frame is an IDR picture, which also repeats SPS and PPS.
     av_opt_set_int(m_context->priv_data, "forced-idr", 1, 0);
+    if (codec == Codec::Hevc444) {
+        // YUV444P frames make NVENC pick Main 4:4:4; say so, so a GPU without it fails here.
+        av_opt_set(m_context->priv_data, "profile", "rext", 0);
+    }
 
-    if (const int rc = avcodec_open2(m_context, codec, nullptr); rc < 0) {
+    if (const int rc = avcodec_open2(m_context, encoder, nullptr); rc < 0) {
         char error[AV_ERROR_MAX_STRING_SIZE] = {};
         av_strerror(rc, error, sizeof(error));
-        qCWarning(KRDP) << "GPU encode: cannot open h264_nvenc:" << error;
+        qCWarning(KRDP) << "GPU encode: cannot open" << encoderName << ":" << error;
         close();
         return false;
     }
@@ -101,10 +106,11 @@ bool GpuH264Encoder::ensure(const AVFrame *frame, quint32 qp, int frameRate, Spe
     m_qp = qp;
     m_frameRate = frameRate;
     m_speed = speed;
+    m_codec = codec;
     m_pts = 0;
     m_keyFrameRequested = false;
     ++m_generation;
-    qCDebug(KRDP) << "GPU encode: h264_nvenc" << size << "QP" << qp << "preset" << preset << "refs" << m_context->refs;
+    qCDebug(KRDP) << "GPU encode:" << encoderName << size << "QP" << qp << "preset" << preset << "refs" << m_context->refs;
     return true;
 }
 

@@ -33,7 +33,7 @@ SPDX-License-Identifier: BSD-2-Clause
       <default>true</default>
     </entry>
     <entry name="videoCodec" key="VideoCodec" type="String">
-      <label>Video codec: KPipeWire (H.264 4:2:0 from KPipeWire), Auto (AVC444 if the client supports it, else AVC420, else RemoteFX), AVC444, AVC420 or RemoteFX</label>
+      <label>Video codec: KPipeWire (H.264 4:2:0 from KPipeWire), Auto (AVC444 if the client supports it, else AVC420, else RemoteFX), AVC444, HEVC444 (H.265 4:4:4 from NVENC for clients built from the oysteinkrog FreeRDP fork, else as AVC444), AVC420 or RemoteFX</label>
       <default>KPipeWire</default>
     </entry>
     <entry name="videoEncoder" key="VideoEncoder" type="String">
