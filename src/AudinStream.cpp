@@ -17,12 +17,14 @@
 #include <QProcess>
 #include <QScopeGuard>
 
+#include "AudioStream.h"
 #include "PeerContext_p.h"
 #include "PipeWireStreamUtils_p.h"
 #include "RdpConnection.h"
 #include "krdp_logging.h"
 
 #include <freerdp/codec/audio.h>
+#include <freerdp/codec/dsp.h>
 #include <freerdp/server/audin.h>
 #include <winpr/stream.h>
 
@@ -34,8 +36,15 @@
 namespace KRdp
 {
 
-static constexpr uint32_t s_sampleRate = 44100;
+// PCM stays at 44100 Hz, the rate mstsc has always used here. Opus runs at 48000 Hz,
+// PipeWire's own rate, so neither end resamples.
+static constexpr uint32_t s_pcmSampleRate = 44100;
+static constexpr uint32_t s_opusSampleRate = 48000;
+static constexpr uint32_t s_maxSampleRate = 48000;
 static constexpr uint32_t s_maxLatencyMs = 200;
+// The client captures this much per Data PDU. 10 ms keeps capture latency low; the
+// client's Opus encoder still sends one packet per Opus frame.
+static constexpr uint32_t s_packetMs = 10;
 // mstsc rejects the AUDIO_INPUT channel when it is opened very early in the session
 // (within about 100 ms of activation), so retry when the client hasn't answered.
 static constexpr qint64 s_openTimeoutMs = 2000;
@@ -65,16 +74,28 @@ public:
     void makeMicrophoneDefault();
     void restoreDefaultSource();
 
-    AudioByteQueue captureRing{size_t(s_sampleRate) * s_maxLatencyMs / 1000 * s_blockAlign};
+    AudioByteQueue captureRing{size_t(s_maxSampleRate) * s_maxLatencyMs / 1000 * s_blockAlign};
     bool captureDropWarned = false;
     std::vector<uint8_t> partialFrame;
 
+    // The format the client agreed to send, and the decoder for it (none for PCM).
+    std::vector<AUDIO_FORMAT> serverFormats;
+    AUDIO_FORMAT negotiated{};
+    UINT32 clientFormatIndex = 0;
+    uint32_t sampleRate = s_pcmSampleRate;
+    std::unique_ptr<FREERDP_DSP_CONTEXT, decltype(&freerdp_dsp_context_free)> decoder{nullptr, freerdp_dsp_context_free};
+    wStream *decoded = nullptr;
+    bool decodeFailWarned = false;
+
     void onData(const SNDIN_DATA *data);
+    UINT onFormats(const SNDIN_FORMATS *formats);
     void ensureMicrophone();
     void teardownMicrophone();
 
     static UINT audinData(audin_server_context *context, const SNDIN_DATA *data);
     static UINT audinVersion(audin_server_context *context, const SNDIN_VERSION *version);
+    static UINT audinFormats(audin_server_context *context, const SNDIN_FORMATS *formats);
+    static UINT audinFormatChange(audin_server_context *context, const SNDIN_FORMATCHANGE *change);
 
 private:
     static void streamParamChanged(void *data, uint32_t id, const spa_pod *param);
@@ -97,6 +118,61 @@ UINT AudinStream::Private::audinVersion(audin_server_context *context, const SND
 UINT AudinStream::Private::audinData(audin_server_context *context, const SNDIN_DATA *data)
 {
     static_cast<Private *>(context->userdata)->onData(data);
+    return CHANNEL_RC_OK;
+}
+
+UINT AudinStream::Private::audinFormats(audin_server_context *context, const SNDIN_FORMATS *formats)
+{
+    return static_cast<Private *>(context->userdata)->onFormats(formats);
+}
+
+// Replaces FreeRDP's default, which hard-codes 441 frames per packet (10 ms only at
+// 44100 Hz) and sends the server-side index as initialFormat. The client reads
+// initialFormat as an index into the list it sent back, which can be shorter.
+UINT AudinStream::Private::onFormats(const SNDIN_FORMATS *formats)
+{
+    if (!formats) {
+        return ERROR_INVALID_DATA;
+    }
+    for (const AUDIO_FORMAT &server : serverFormats) {
+        for (UINT32 j = 0; j < formats->NumFormats; ++j) {
+            if (!audio_format_compatible(&server, &formats->SoundFormats[j])) {
+                continue;
+            }
+            if (server.wFormatTag != WAVE_FORMAT_PCM) {
+                decoder.reset(freerdp_dsp_context_new(FALSE));
+                if (!decoder || !freerdp_dsp_context_reset(decoder.get(), &server, 0)) {
+                    qCWarning(KRDP) << "Audio input: could not set up a decoder for" << audio_format_get_tag_string(server.wFormatTag);
+                    decoder.reset();
+                    continue;
+                }
+            }
+            negotiated = server;
+            clientFormatIndex = j;
+            sampleRate = server.nSamplesPerSec;
+
+            SNDIN_OPEN open{};
+            open.FramesPerPacket = sampleRate * s_packetMs / 1000;
+            open.initialFormat = j;
+            open.captureFormat = audioFormat(WAVE_FORMAT_PCM, sampleRate);
+            qCDebug(KRDP) << "Audio input: negotiated" << audio_format_get_tag_string(server.wFormatTag) << sampleRate << "Hz"
+                          << server.nChannels << "ch," << server.nAvgBytesPerSec * 8 / 1000 << "kbit/s";
+            return audin->SendOpen(audin, &open);
+        }
+    }
+    qCWarning(KRDP) << "Audio input: no common microphone format with the client";
+    return ERROR_INVALID_DATA;
+}
+
+// The client confirms the format from the Open PDU with a Format Change PDU. FreeRDP's
+// default handler checks it against an index that only its own format handler sets.
+UINT AudinStream::Private::audinFormatChange(audin_server_context *context, const SNDIN_FORMATCHANGE *change)
+{
+    auto *d = static_cast<Private *>(context->userdata);
+    if (!change || change->NewFormat != d->clientFormatIndex) {
+        qCWarning(KRDP) << "Audio input: client switched to format" << (change ? change->NewFormat : 0) << "instead of" << d->clientFormatIndex;
+        return ERROR_INVALID_DATA;
+    }
     return CHANNEL_RC_OK;
 }
 
@@ -172,6 +248,8 @@ bool AudinStream::open()
     d->audin->Data = Private::audinData;
     d->defaultReceiveVersion = d->audin->ReceiveVersion;
     d->audin->ReceiveVersion = Private::audinVersion;
+    d->audin->ReceiveFormats = Private::audinFormats;
+    d->audin->ReceiveFormatChange = Private::audinFormatChange;
     d->clientAnswered = false;
 
     auto cleanup = qScopeGuard([this]() {
@@ -179,8 +257,16 @@ bool AudinStream::open()
         d->audin = nullptr;
     });
 
-    const AUDIO_FORMAT serverFormat = audioFormat(WAVE_FORMAT_PCM, s_sampleRate);
-    if (!audin_server_set_formats(d->audin, 1, &serverFormat)) {
+    // Preferred first. Opus only when this FreeRDP can decode it, and when the
+    // configured codec is not PCM; it uses the same AudioBitrate as the output.
+    const AudioSettings audio = AudioStream::settings();
+    d->serverFormats.clear();
+    const AUDIO_FORMAT opus = audioFormat(WAVE_FORMAT_OPUS, s_opusSampleRate, audio.bitrateKbit * 1000 / 8);
+    if (audio.codec != AudioSettings::Codec::Pcm && freerdp_dsp_supports_format(&opus, FALSE)) {
+        d->serverFormats.push_back(opus);
+    }
+    d->serverFormats.push_back(audioFormat(WAVE_FORMAT_PCM, s_pcmSampleRate));
+    if (!audin_server_set_formats(d->audin, SSIZE_T(d->serverFormats.size()), d->serverFormats.data())) {
         qCWarning(KRDP) << "Failed to set audin server formats";
         return false;
     }
@@ -269,7 +355,7 @@ void AudinStream::Private::ensureMicrophone()
 
     uint8_t buffer[512];
     spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-    const spa_pod *params[1] = {buildAudioFormatPod(builder, s_sampleRate)};
+    const spa_pod *params[1] = {buildAudioFormatPod(builder, sampleRate)};
 
     pw_properties *props = pw_properties_new(PW_KEY_MEDIA_TYPE,
                                              "Audio",
@@ -319,8 +405,28 @@ void AudinStream::Private::onData(const SNDIN_DATA *data)
         return;
     }
 
-    const size_t incoming = Stream_GetRemainingLength(data->Data);
+    size_t incoming = Stream_GetRemainingLength(data->Data);
     const auto *samples = reinterpret_cast<const uint8_t *>(Stream_Pointer(data->Data));
+    if (decoder) {
+        // One Data PDU carries at most one Opus packet: the client sends 10 ms of
+        // capture per PDU and its encoder writes a packet only when a frame is full.
+        if (incoming == 0) {
+            return;
+        }
+        if (!decoded) {
+            decoded = Stream_New(nullptr, size_t(sampleRate) * s_blockAlign / 10);
+        }
+        if (!decoded) {
+            return;
+        }
+        Stream_SetPosition(decoded, 0);
+        if (!freerdp_dsp_decode(decoder.get(), &negotiated, samples, incoming, decoded)) {
+            logDropOnce(true, decodeFailWarned, "Audio input: could not decode a microphone packet; dropping it");
+            return;
+        }
+        samples = Stream_Buffer(decoded);
+        incoming = Stream_GetPosition(decoded);
+    }
     partialFrame.insert(partialFrame.end(), samples, samples + incoming);
 
     const size_t whole = (partialFrame.size() / s_blockAlign) * s_blockAlign;
@@ -354,6 +460,13 @@ void AudinStream::close()
         d->audin = nullptr;
     }
     d->teardownMicrophone();
+    d->decoder.reset();
+    if (d->decoded) {
+        Stream_Free(d->decoded, TRUE);
+        d->decoded = nullptr;
+    }
+    d->decodeFailWarned = false;
+    d->sampleRate = s_pcmSampleRate;
 }
 
 }
