@@ -73,13 +73,25 @@ public:
                 m_resizeTimer.start();
             });
             // Fit the monitor to the client's window or screen at connect, not only on resize.
-            // Run it at once rather than debounced: until the monitor has the client's size,
-            // the stream holds back frames (see waitForFrameSize()).
+            // Run it once the portal session has started, not before: the hook turns other
+            // monitors off, and doing that while the portal sets up the screencast left the
+            // portal without an answer and the client with a black screen (2026-10-25).
+            // Not debounced: until the monitor has the client's size, the stream holds back
+            // frames (see waitForFrameSize()).
             if (connection->clientDesktopSize().isValid()) {
                 m_requestedSize = connection->clientDesktopSize();
-                runResizeHook();
+                m_resizeOnStart = true;
             }
         }
+
+        // A portal that never answers would leave the client on a black screen for as long
+        // as it stays connected. End the connection instead, so the client can reconnect.
+        QTimer::singleShot(std::chrono::seconds(15), this, [this] {
+            if (!m_sessionStarted && connection) {
+                qWarning() << "Portal session did not start within 15 s; closing the connection";
+                Q_EMIT sessionError();
+            }
+        });
 
         connect(connection, &QObject::destroyed, this, &SessionWrapper::onConnectionDestroyed);
     }
@@ -116,6 +128,10 @@ public:
         m_sessionStarted = true;
         connection->videoStream()->setPipeWireSource(session->nodeId(), session->objectSerial(), session->takePipeWireFd());
         connection->videoStream()->setStreamingEnabled(connection->videoStream()->enabled());
+        if (m_resizeOnStart) {
+            m_resizeOnStart = false;
+            runResizeHook();
+        }
     }
 
     void onConnectionDestroyed()
@@ -133,6 +149,7 @@ public:
     QTimer m_resizeTimer;
     QSize m_requestedSize;
     bool m_sessionStarted = false;
+    bool m_resizeOnStart = false;
 };
 
 SessionController::SessionController(KRdp::Server *server, SessionType sessionType)
