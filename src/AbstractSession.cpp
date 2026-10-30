@@ -49,15 +49,17 @@ AbstractSession::AbstractSession()
 
         // text only, arbitrary MIME payloads can block on Wayland/XWayland targets (SAVE_TARGETS)
         const QString text = data->hasText() ? data->text() : QString();
-        if (!data->hasText()) {
+        if (text.isEmpty()) {
+            // Leave the client's clipboard alone. Announcing an empty update made the client
+            // drop what it had: the lock screen sets x-kde-lockscreen, so every lock of this
+            // machine wiped the client's clipboard, and a copied image pasted as nothing.
             qCDebug(KRDP) << "Ignoring non-text clipboard update with formats" << data->formats();
+            return;
         }
 
         // KSystemClipboard keeps ownership of what it returns, copy into a new QMimeData
         auto newData = new QMimeData();
-        if (!text.isEmpty()) {
-            newData->setText(text);
-        }
+        newData->setText(text);
 
         Q_EMIT clipboardDataChanged(newData);
     });
