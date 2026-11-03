@@ -47,21 +47,60 @@ const QDBusArgument &operator>>(const QDBusArgument &arg, PortalSessionStream &s
     return arg;
 }
 
+QString PortalRequest::requestPath(const QString &handleToken)
+{
+    // org.freedesktop.portal.Request: /org/freedesktop/portal/desktop/request/SENDER/TOKEN, where
+    // SENDER is the caller's unique bus name without the ':' and with '.' replaced by '_'.
+    QString sender = QDBusConnection::sessionBus().baseService().mid(1);
+    sender.replace(u'.', u'_');
+    return QStringLiteral("/org/freedesktop/portal/desktop/request/%1/%2").arg(sender, handleToken);
+}
+
+void PortalRequest::subscribe(const QString &path)
+{
+    m_path = path;
+    QDBusConnection::sessionBus().connect(QString{}, path, dbusRequestInterface, dbusResponse, this, SLOT(onFinished(uint, QVariantMap)));
+}
+
+void PortalRequest::unsubscribe()
+{
+    if (!m_path.isEmpty()) {
+        QDBusConnection::sessionBus().disconnect(QString{}, m_path, dbusRequestInterface, dbusResponse, this, SLOT(onFinished(uint, QVariantMap)));
+        m_path.clear();
+    }
+}
+
 void PortalRequest::onStarted(QDBusPendingCallWatcher *watcher)
 {
     QDBusPendingReply<QDBusObjectPath> reply = *watcher;
-    if (!reply.isError()) {
-        QDBusConnection::sessionBus().connect(QString{}, reply.value().path(), dbusRequestInterface, dbusResponse, this, SLOT(onFinished(uint, QVariantMap)));
-    } else {
-        m_callback(-1, {{QStringLiteral("errorMessage"), reply.error().message()}});
-    }
     watcher->deleteLater();
+    if (reply.isError()) {
+        qCWarning(KRDP) << "Portal:" << m_step << "failed:" << reply.error().message();
+        unsubscribe();
+        if (m_context) {
+            m_callback(-1, {{QStringLiteral("errorMessage"), reply.error().message()}});
+        }
+        deleteLater();
+        return;
+    }
+    // Portals older than version 0.9 do not build the path from the token.
+    if (reply.value().path() != m_path) {
+        qCDebug(KRDP) << "Portal:" << m_step << "answers on" << reply.value().path() << "not" << m_path;
+        unsubscribe();
+        subscribe(reply.value().path());
+    }
 }
 
 void PortalRequest::onFinished(uint code, const QVariantMap &result)
 {
+    qCDebug(KRDP) << "Portal:" << m_step << "answered" << code << "after" << m_elapsed.elapsed() << "ms";
     if (m_context) {
         m_callback(code, result);
+    } else if (const auto session = result.value(QStringLiteral("session_handle")).toString(); !session.isEmpty()) {
+        // The connection gave up before the portal answered. Close the session the portal
+        // made, or it stays open in the portal for good.
+        qCWarning(KRDP) << "Portal: closing session" << session << "that answered after its connection closed";
+        QDBusConnection::sessionBus().asyncCall(QDBusMessage::createMethodCall(dbusService, session, dbusSessionInterface, QStringLiteral("Close")));
     }
     deleteLater();
 }
@@ -119,7 +158,9 @@ void PortalSession::start()
         {QStringLiteral("handle_token"), createHandleToken()},
         {QStringLiteral("session_handle_token"), createHandleToken()},
     };
-    new PortalRequest(d->remoteInterface->CreateSession(parameters), this, &PortalSession::onCreateSession);
+    new PortalRequest(u"CreateSession"_s, parameters.value(u"handle_token"_s).toString(), this, &PortalSession::onCreateSession, [&] {
+        return d->remoteInterface->CreateSession(parameters);
+    });
 }
 
 void PortalSession::sendEvent(const std::shared_ptr<QEvent> &event)
@@ -161,7 +202,9 @@ void PortalSession::onCreateSession(uint code, const QVariantMap &result)
         parameters[QStringLiteral("restore_token")] = restoreToken;
     }
 
-    new PortalRequest(d->remoteInterface->SelectDevices(d->sessionPath, parameters), this, &PortalSession::onDevicesSelected);
+    new PortalRequest(u"SelectDevices"_s, parameters.value(u"handle_token"_s).toString(), this, &PortalSession::onDevicesSelected, [&] {
+        return d->remoteInterface->SelectDevices(d->sessionPath, parameters);
+    });
 }
 
 void PortalSession::onDevicesSelected(uint code, const QVariantMap & /*result*/)
@@ -180,8 +223,11 @@ void PortalSession::onDevicesSelected(uint code, const QVariantMap & /*result*/)
                       {QStringLiteral("multiple"), activeStream().has_value()}};
     }
     parameters[QStringLiteral("cursor_mode")] = 4u; // Metadata
+    parameters[QStringLiteral("handle_token")] = createHandleToken();
 
-    new PortalRequest(d->screencastInterface->SelectSources(d->sessionPath, parameters), this, &PortalSession::onSourcesSelected);
+    new PortalRequest(u"SelectSources"_s, parameters.value(u"handle_token"_s).toString(), this, &PortalSession::onSourcesSelected, [&] {
+        return d->screencastInterface->SelectSources(d->sessionPath, parameters);
+    });
 }
 
 void PortalSession::onSourcesSelected(uint code, const QVariantMap & /*result*/)
@@ -195,7 +241,9 @@ void PortalSession::onSourcesSelected(uint code, const QVariantMap & /*result*/)
     auto parameters = QVariantMap{
         {QStringLiteral("handle_token"), createHandleToken()},
     };
-    new PortalRequest(d->remoteInterface->Start(d->sessionPath, QString{}, parameters), this, &PortalSession::onSessionStarted);
+    new PortalRequest(u"Start"_s, parameters.value(u"handle_token"_s).toString(), this, &PortalSession::onSessionStarted, [&] {
+        return d->remoteInterface->Start(d->sessionPath, QString{}, parameters);
+    });
 }
 
 void KRdp::PortalSession::onSessionStarted(uint code, const QVariantMap &result)

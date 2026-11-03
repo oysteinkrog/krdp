@@ -10,6 +10,7 @@
 #include <type_traits>
 
 #include <QDBusPendingCallWatcher>
+#include <QElapsedTimer>
 #include <QObject>
 #include <QPoint>
 #include <QPointer>
@@ -30,9 +31,19 @@ class PortalRequest : public QObject
 {
     Q_OBJECT
 public:
+    /**
+     * \param step Name of the step, for the log.
+     * \param handleToken The handle_token in the call's options. The portal sends the Response
+     * signal on a request path built from it, so this subscribes to that path before making
+     * the call. Subscribing only after the call returned could miss a fast Response, and the
+     * request then never finished: the client stayed on a black screen until KRDP's portal
+     * timeout dropped it.
+     * \param makeCall Makes the portal call.
+     */
     template<typename ContextType, typename Callback>
-    PortalRequest(const QDBusPendingCall &call, ContextType *context, Callback callback)
+    PortalRequest(const QString &step, const QString &handleToken, ContextType *context, Callback callback, const std::function<QDBusPendingCall()> &makeCall)
         : m_context(context)
+        , m_step(step)
     {
         if constexpr (std::is_member_function_pointer<Callback>::value) {
             m_callback = std::bind(callback, context, std::placeholders::_1, std::placeholders::_2);
@@ -40,19 +51,25 @@ public:
             m_callback = callback;
         }
 
-        auto watcher = new QDBusPendingCallWatcher(call);
-        // We need to wait here because otherwise we risk the signal arriving
-        // before we know what path to listen on.
+        m_elapsed.start();
+        subscribe(requestPath(handleToken));
+        auto watcher = new QDBusPendingCallWatcher(makeCall());
         watcher->waitForFinished();
         onStarted(watcher);
     }
 
 private:
+    static QString requestPath(const QString &handleToken);
+    void subscribe(const QString &path);
+    void unsubscribe();
     void onStarted(QDBusPendingCallWatcher *watcher);
     Q_SLOT void onFinished(uint code, const QVariantMap &result);
 
     QPointer<QObject> m_context;
     std::function<void(uint, const QVariantMap &)> m_callback;
+    QString m_step;
+    QString m_path;
+    QElapsedTimer m_elapsed;
 };
 
 struct PortalSessionStream {
